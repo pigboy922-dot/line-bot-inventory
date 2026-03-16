@@ -1,584 +1,514 @@
-import json
 import os
+import json
+import traceback
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, Any, List, Optional
 
+from flask import Flask, request, abort
+from dotenv import load_dotenv
 import gspread
-from flask import Flask, abort, request
+from google.oauth2.service_account import Credentials
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
-from oauth2client.service_account import ServiceAccountCredentials
+
+load_dotenv()
 
 app = Flask(__name__)
 
-CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
-CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
-GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "")
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+APP_TIMEZONE = os.getenv("APP_TIMEZONE", "Asia/Taipei")
+WORKSHEET_NAME = os.getenv("GOOGLE_WORKSHEET_NAME", "Sheet1")
 
-if not CHANNEL_SECRET or not CHANNEL_ACCESS_TOKEN:
-    raise ValueError("請先設定 LINE_CHANNEL_SECRET 與 LINE_CHANNEL_ACCESS_TOKEN")
-if not GOOGLE_SERVICE_ACCOUNT_JSON or not GOOGLE_SHEET_ID:
-    raise ValueError("請先設定 GOOGLE_SERVICE_ACCOUNT_JSON 與 GOOGLE_SHEET_ID")
+if not LINE_CHANNEL_SECRET or not LINE_CHANNEL_ACCESS_TOKEN:
+    print("[WARN] LINE_CHANNEL_SECRET / LINE_CHANNEL_ACCESS_TOKEN 未設定")
 
-line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
-handler = WebhookHandler(CHANNEL_SECRET)
+line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
+handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-SESSIONS: Dict[str, dict] = {}
+# 簡易記憶體狀態。Render 重啟後會清空，但一般互動流程足夠。
+USER_STATES: Dict[str, Dict[str, Any]] = {}
 
-INVENTORY_HEADERS = ["品名", "尺寸", "庫存", "位置", "備註", "更新時間"]
-LOG_HEADERS = ["時間", "類型", "品名", "尺寸", "數量", "位置", "備註", "使用者"]
+HEADER_ALIASES = {
+    "name": ["品名", "名稱", "型號", "品號", "料號", "item", "name"],
+    "size": ["尺寸", "尺寸/mm", "尺寸mm", "規格", "size"],
+    "qty": ["數量", "庫存", "qty", "quantity"],
+    "location": ["位置", "儲位", "location", "loc"],
+    "remark": ["備註", "註記", "remark", "note", "notes"],
+    "updated_at": ["更新時間", "最後更新", "updated_at", "time", "時間"],
+}
 
 
-# -----------------------------
-# Google Sheet helpers
-# -----------------------------
 def now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def get_gc():
-    info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
-    scope = [
-        "https://spreadsheets.google.com/feeds",
+def parse_service_account_info() -> Dict[str, Any]:
+    raw = GOOGLE_SERVICE_ACCOUNT_JSON.strip()
+    if not raw:
+        raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON 未設定")
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        # 允許貼上被跳脫的 json
+        return json.loads(raw.encode("utf-8").decode("unicode_escape"))
+
+
+def get_worksheet():
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
-    creds = ServiceAccountCredentials.from_json_keyfile_dict(info, scope)
-    return gspread.authorize(creds)
-
-
-def col_letter(n: int) -> str:
-    result = ""
-    while n > 0:
-        n, rem = divmod(n - 1, 26)
-        result = chr(65 + rem) + result
-    return result
-
-
-def get_sheet(name: str, headers: List[str]):
-    gc = get_gc()
+    creds = Credentials.from_service_account_info(parse_service_account_info(), scopes=scopes)
+    gc = gspread.authorize(creds)
     sh = gc.open_by_key(GOOGLE_SHEET_ID)
     try:
-        ws = sh.worksheet(name)
+        return sh.worksheet(WORKSHEET_NAME)
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=name, rows=1000, cols=max(10, len(headers) + 2))
-        ws.append_row(headers)
-
-    current_headers = ws.row_values(1)
-    if current_headers != headers:
-        ws.resize(rows=max(ws.row_count, 2), cols=max(ws.col_count, len(headers)))
-        ws.update(f"A1:{col_letter(len(headers))}1", [headers])
-    return ws
+        return sh.sheet1
 
 
-def inventory_ws():
-    return get_sheet("inventory", INVENTORY_HEADERS)
+def normalize_text(s: Any) -> str:
+    return str(s).strip() if s is not None else ""
 
 
-def log_ws():
-    return get_sheet("transactions", LOG_HEADERS)
+def canonicalize_headers(headers: List[str]) -> Dict[str, int]:
+    mapping: Dict[str, int] = {}
+    norm_headers = [normalize_text(h) for h in headers]
+    for canon, aliases in HEADER_ALIASES.items():
+        for idx, h in enumerate(norm_headers):
+            h_low = h.lower().replace(" ", "")
+            for alias in aliases:
+                if h_low == alias.lower().replace(" ", ""):
+                    mapping[canon] = idx
+                    break
+            if canon in mapping:
+                break
+    return mapping
 
 
-def get_records() -> List[dict]:
-    ws = inventory_ws()
-    rows = ws.get_all_records(expected_headers=INVENTORY_HEADERS)
-    cleaned = []
+def ensure_headers(ws):
+    headers = ws.row_values(1)
+    if not headers:
+        ws.update("A1:E1", [["品名", "尺寸", "數量", "位置", "備註"]])
+        headers = ws.row_values(1)
+    mapping = canonicalize_headers(headers)
+
+    desired = ["品名", "尺寸", "數量", "位置", "備註", "更新時間"]
+    changed = False
+    current = headers[:]
+    if len(current) < len(desired):
+        current.extend([""] * (len(desired) - len(current)))
+    canonical_current = canonicalize_headers(current)
+
+    # 依據現有可辨識欄位填補固定位置，避免抓不到「尺寸/mm」之類欄位
+    for i, key in enumerate(["name", "size", "qty", "location", "remark", "updated_at"]):
+        label = desired[i]
+        if i >= len(headers) or not normalize_text(headers[i]):
+            current[i] = label
+            changed = True
+        elif key not in canonical_current:
+            current[i] = label
+            changed = True
+
+    if changed:
+        ws.update(f"A1:F1", [current[:6]])
+        headers = ws.row_values(1)
+        mapping = canonicalize_headers(headers)
+
+    return headers, mapping
+
+
+def all_records(ws) -> List[Dict[str, Any]]:
+    headers, mapping = ensure_headers(ws)
+    values = ws.get_all_values()
+    rows = values[1:] if len(values) > 1 else []
+    records = []
     for idx, row in enumerate(rows, start=2):
-        row["_row"] = idx
-        row["品名"] = str(row.get("品名", "")).strip()
-        row["尺寸"] = str(row.get("尺寸", "")).strip()
-        row["位置"] = str(row.get("位置", "")).strip()
-        row["備註"] = str(row.get("備註", "")).strip()
-        try:
-            row["庫存"] = int(float(row.get("庫存", 0) or 0))
-        except Exception:
-            row["庫存"] = 0
-        cleaned.append(row)
-    return cleaned
+        row = row + [""] * (len(headers) - len(row))
+        record = {
+            "row_number": idx,
+            "name": row[mapping.get("name", 0)] if mapping.get("name") is not None else "",
+            "size": row[mapping.get("size", 1)] if mapping.get("size") is not None else "",
+            "qty": row[mapping.get("qty", 2)] if mapping.get("qty") is not None else "",
+            "location": row[mapping.get("location", 3)] if mapping.get("location") is not None else "",
+            "remark": row[mapping.get("remark", 4)] if mapping.get("remark") is not None else "",
+            "updated_at": row[mapping.get("updated_at", 5)] if mapping.get("updated_at") is not None else "",
+        }
+        if any(normalize_text(v) for k, v in record.items() if k != "row_number"):
+            records.append(record)
+    return records
 
 
-# -----------------------------
-# General helpers
-# -----------------------------
-def session_key(event) -> str:
-    source = event.source
-    return (
-        getattr(source, "user_id", None)
-        or getattr(source, "group_id", None)
-        or getattr(source, "room_id", None)
-        or "default"
-    )
-
-
-def actor_name(event) -> str:
-    source = event.source
-    return (
-        getattr(source, "user_id", None)
-        or getattr(source, "group_id", None)
-        or getattr(source, "room_id", None)
-        or "unknown"
-    )
-
-
-def normalize(s: str) -> str:
-    return (s or "").strip().lower()
-
-
-def set_session(key: str, data: dict):
-    SESSIONS[key] = data
-
-
-def get_session(key: str) -> Optional[dict]:
-    return SESSIONS.get(key)
-
-
-def clear_session(key: str):
-    SESSIONS.pop(key, None)
-
-
-def search_inventory(keyword: str) -> List[dict]:
-    keyword_n = normalize(keyword)
-    if not keyword_n:
+def search_records(keyword: str) -> List[Dict[str, Any]]:
+    ws = get_worksheet()
+    records = all_records(ws)
+    kw = normalize_text(keyword).lower().replace(" ", "")
+    if not kw:
         return []
-
     results = []
-    for row in get_records():
-        hay = f"{row['品名']} {row['尺寸']} {row['位置']} {row['備註']}".lower()
-        if keyword_n in hay:
-            results.append(row)
+    for r in records:
+        hay = " ".join([normalize_text(r["name"]), normalize_text(r["size"]), normalize_text(r["location"])]).lower().replace(" ", "")
+        if kw in hay:
+            results.append(r)
     return results
 
 
-def distinct_items(rows: List[dict]) -> List[dict]:
-    seen = set()
-    items = []
-    for row in rows:
-        key = (normalize(row["品名"]), normalize(row["尺寸"]))
-        if key not in seen:
-            seen.add(key)
-            items.append(row)
-    return items
+def source_key(event) -> str:
+    src = event.source
+    t = getattr(src, "type", "user")
+    if t == "group":
+        return f"group:{src.group_id}"
+    if t == "room":
+        return f"room:{src.room_id}"
+    return f"user:{src.user_id}"
 
 
-def format_search_result(rows: List[dict], keyword: str) -> str:
-    if not rows:
-        return f"找不到包含【{keyword}】的資料。"
+def reset_state(key: str):
+    USER_STATES.pop(key, None)
 
-    lines = [f"找到 {len(rows)} 筆【{keyword}】相關資料："]
-    for i, row in enumerate(rows[:15], start=1):
-        lines.append(
-            f"{i}. {row['品名']} / 尺寸:{row['尺寸'] or '-'} / 庫存:{row['庫存']} / 位置:{row['位置'] or '-'}"
-        )
-    if len(rows) > 15:
-        lines.append(f"…其餘 {len(rows) - 15} 筆未顯示")
+
+def set_state(key: str, **kwargs):
+    USER_STATES[key] = kwargs
+
+
+def get_state(key: str) -> Dict[str, Any]:
+    return USER_STATES.get(key, {})
+
+
+def menu_text() -> str:
+    return "塊材查詢選單：\n1. 查詢\n2. 入庫\n3. 出庫\n4. 取消\n\n請輸入 1、2、3、4"
+
+
+def format_search_results(results: List[Dict[str, Any]]) -> str:
+    if not results:
+        return "查無資料，請重新輸入關鍵字，或輸入 4 取消。"
+    lines = ["找到以下結果，請輸入編號："]
+    for i, r in enumerate(results[:20], start=1):
+        lines.append(f"{i}. {r['name']} / 尺寸 {r['size'] or '-'} / 庫存 {r['qty'] or '0'} / 位置 {r['location'] or '-'}")
+    if len(results) > 20:
+        lines.append(f"\n共 {len(results)} 筆，先顯示前 20 筆。")
     return "\n".join(lines)
 
 
-def upsert_inventory(item_name: str, size: str, qty_delta: int, location: str, note: str):
-    ws = inventory_ws()
-    records = get_records()
-    match = None
-    for row in records:
-        if normalize(row["品名"]) == normalize(item_name) and normalize(row["尺寸"]) == normalize(size):
-            match = row
-            break
-
-    if match:
-        new_qty = match["庫存"] + qty_delta
-        if new_qty < 0:
-            raise ValueError(f"庫存不足，目前庫存 {match['庫存']}，無法出庫 {abs(qty_delta)}")
-        ws.update(
-            f"A{match['_row']}:F{match['_row']}",
-            [[
-                item_name,
-                size,
-                new_qty,
-                location or match["位置"],
-                note or match["備註"],
-                now_str(),
-            ]],
-        )
-    else:
-        if qty_delta < 0:
-            raise ValueError("找不到此品項，無法直接出庫。")
-        ws.append_row([item_name, size, qty_delta, location, note, now_str()])
+def to_int(value: str) -> Optional[int]:
+    try:
+        return int(str(value).strip())
+    except Exception:
+        return None
 
 
-def append_log(action: str, item_name: str, size: str, qty: int, location: str, note: str, actor: str):
-    ws = log_ws()
-    ws.append_row([now_str(), action, item_name, size, qty, location, note, actor])
+def update_row_qty(row_number: int, new_qty: int, remark: str = ""):
+    ws = get_worksheet()
+    headers, mapping = ensure_headers(ws)
+    qty_col = mapping.get("qty", 2) + 1
+    remark_col = mapping.get("remark", 4) + 1
+    updated_at_col = mapping.get("updated_at", 5) + 1
+    ws.update_cell(row_number, qty_col, str(new_qty))
+    if remark:
+        ws.update_cell(row_number, remark_col, remark)
+    ws.update_cell(row_number, updated_at_col, now_str())
 
 
-def reply(event, text: str):
-    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=text[:4900]))
+def append_row(name: str, size: str, qty: int, location: str, remark: str = ""):
+    ws = get_worksheet()
+    ensure_headers(ws)
+    ws.append_row([name, size, str(qty), location, remark, now_str()])
 
 
-def show_main_menu(event):
-    reply(
-        event,
-        "塊材查詢選單：\n"
-        "1. 查詢\n"
-        "2. 入庫\n"
-        "3. 出庫\n"
-        "4. 取消\n\n"
-        "請輸入 1、2、3、4",
-    )
+def reply_safe(reply_token: str, text: str):
+    line_bot_api.reply_message(reply_token, TextSendMessage(text=text))
 
 
-def start_transaction_menu(key: str, action: str):
-    set_session(
-        key,
-        {
-            "step": "action_keyword",
-            "action": action,
-            "item_name": "",
-            "size": "",
-            "location": "",
-            "note": "",
-            "qty": None,
-        },
-    )
-
-
-# -----------------------------
-# Flask routes
-# -----------------------------
-@app.route("/", methods=["GET"])
+@app.route("/", methods=["GET", "HEAD"])
 def home():
-    return "LINE Bot running"
+    return "LINE Bot running", 200
 
 
 @app.route("/callback", methods=["POST"])
 def callback():
     signature = request.headers.get("X-Line-Signature", "")
     body = request.get_data(as_text=True)
-    app.logger.info("Request body: %s", body)
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
         abort(400)
-    return "OK"
+    except Exception:
+        print(traceback.format_exc())
+        return "OK", 200
+    return "OK", 200
 
 
-# -----------------------------
-# LINE message handling
-# -----------------------------
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
-    text = event.message.text.strip()
-    key = session_key(event)
-    sess = get_session(key)
+    user_text = normalize_text(event.message.text)
+    key = source_key(event)
+    state = get_state(key)
 
-    if text in ["取消", "結束", "exit", "4"] and sess:
-        clear_session(key)
-        reply(event, "已取消目前流程。")
-        return
-
-    if text == "塊材查詢":
-        set_session(key, {"step": "main_menu"})
-        show_main_menu(event)
-        return
-
-    # 相容舊指令
-    if text.startswith("查詢 "):
-        keyword = text.replace("查詢", "", 1).strip()
-        reply(event, format_search_result(search_inventory(keyword), keyword))
-        return
-
-    if text.startswith("入庫 "):
-        keyword = text.replace("入庫", "", 1).strip()
-        set_session(key, {"step": "action_keyword", "action": "入庫"})
-        handle_action_keyword(event, key, keyword)
-        return
-
-    if text.startswith("出庫 "):
-        keyword = text.replace("出庫", "", 1).strip()
-        set_session(key, {"step": "action_keyword", "action": "出庫"})
-        handle_action_keyword(event, key, keyword)
-        return
-
-    if sess:
-        handle_session_reply(event, sess, text)
-        return
-
-    reply(
-        event,
-        "請輸入【塊材查詢】開始。\n\n"
-        "也可直接輸入：\n"
-        "查詢 509\n"
-        "入庫 509\n"
-        "出庫 509",
-    )
-
-
-def handle_session_reply(event, sess: dict, text: str):
-    key = session_key(event)
-    step = sess.get("step")
-
-    if step == "main_menu":
-        if text == "1":
-            start_transaction_menu(key, "查詢")
-            reply(event, "請輸入關鍵字")
+    try:
+        if user_text in ["取消", "4"] and (state or user_text == "4"):
+            reset_state(key)
+            reply_safe(event.reply_token, "已取消流程。\n\n輸入「塊材查詢」可重新開始。")
             return
-        if text == "2":
-            start_transaction_menu(key, "入庫")
-            reply(event, "請輸入關鍵字")
-            return
-        if text == "3":
-            start_transaction_menu(key, "出庫")
-            reply(event, "請輸入關鍵字")
-            return
-        if text == "4":
-            clear_session(key)
-            reply(event, "已取消。")
-            return
-        reply(event, "請輸入 1、2、3、4")
-        return
 
-    if step == "action_keyword":
-        handle_action_keyword(event, key, text)
-        return
+        if user_text == "塊材查詢":
+            set_state(key, step="menu")
+            reply_safe(event.reply_token, menu_text())
+            return
 
-    if step == "no_match_inbound_decision":
-        if text == "1":
-            sess["step"] = "manual_item_name"
-            set_session(key, sess)
-            reply(event, "請輸入要新增的完整品名")
+        if not state:
             return
-        if text == "2":
-            sess["step"] = "action_keyword"
-            set_session(key, sess)
-            reply(event, "請重新輸入關鍵字")
-            return
-        reply(event, "請輸入 1 手動新增，或 2 重新搜尋，或輸入 取消")
-        return
 
-    if step == "choose_item":
-        if text == "0" and sess.get("action") == "入庫":
-            sess["step"] = "manual_item_name"
-            set_session(key, sess)
-            reply(event, "請輸入要新增的完整品名")
+        step = state.get("step")
+
+        if step == "menu":
+            if user_text == "1":
+                set_state(key, step="query_keyword", action="query")
+                reply_safe(event.reply_token, "請輸入關鍵字")
+                return
+            if user_text == "2":
+                set_state(key, step="stockin_keyword", action="stockin")
+                reply_safe(event.reply_token, "請輸入關鍵字")
+                return
+            if user_text == "3":
+                set_state(key, step="stockout_keyword", action="stockout")
+                reply_safe(event.reply_token, "請輸入關鍵字")
+                return
+            reply_safe(event.reply_token, "請輸入 1、2、3、4")
             return
+
+        if step in ["query_keyword", "stockin_keyword", "stockout_keyword"]:
+            results = search_records(user_text)
+            action = state.get("action")
+
+            if action == "query":
+                if not results:
+                    reply_safe(event.reply_token, f"找不到【{user_text}】相關資料。\n請重新輸入關鍵字，或輸入 4 取消。")
+                    return
+                reset_state(key)
+                reply_safe(event.reply_token, format_search_results(results))
+                return
+
+            if action == "stockin":
+                if not results:
+                    set_state(key, step="stockin_not_found", action="stockin", keyword=user_text)
+                    reply_safe(event.reply_token, f"找不到【{user_text}】現有編號。\n1. 手動新增\n2. 重新輸入關鍵字\n\n請輸入 1 或 2")
+                    return
+                set_state(key, step="stockin_pick", action="stockin", keyword=user_text, results=results)
+                reply_safe(event.reply_token, format_search_results(results))
+                return
+
+            if action == "stockout":
+                if not results:
+                    reply_safe(event.reply_token, f"找不到【{user_text}】相關資料。\n請重新輸入關鍵字，或輸入 4 取消。")
+                    return
+                set_state(key, step="stockout_pick", action="stockout", keyword=user_text, results=results)
+                reply_safe(event.reply_token, format_search_results(results))
+                return
+
+        if step == "stockin_not_found":
+            if user_text == "1":
+                set_state(key, step="manual_name")
+                reply_safe(event.reply_token, "請輸入完整品名")
+                return
+            if user_text == "2":
+                set_state(key, step="stockin_keyword", action="stockin")
+                reply_safe(event.reply_token, "請重新輸入關鍵字")
+                return
+            reply_safe(event.reply_token, "請輸入 1 或 2")
+            return
+
+        if step == "manual_name":
+            state["new_name"] = user_text
+            state["step"] = "manual_size"
+            USER_STATES[key] = state
+            reply_safe(event.reply_token, "請輸入尺寸")
+            return
+
+        if step == "manual_size":
+            state["new_size"] = user_text
+            state["step"] = "manual_location"
+            USER_STATES[key] = state
+            reply_safe(event.reply_token, "請輸入位置")
+            return
+
+        if step == "manual_location":
+            state["new_location"] = user_text
+            state["step"] = "manual_remark"
+            USER_STATES[key] = state
+            reply_safe(event.reply_token, "請輸入備註，沒有請輸入 無")
+            return
+
+        if step == "manual_remark":
+            state["new_remark"] = "" if user_text == "無" else user_text
+            state["step"] = "manual_qty"
+            USER_STATES[key] = state
+            reply_safe(event.reply_token, "請輸入入庫數量")
+            return
+
+        if step == "manual_qty":
+            qty = to_int(user_text)
+            if qty is None or qty < 0:
+                reply_safe(event.reply_token, "數量格式錯誤，請輸入整數")
+                return
+            state["new_qty"] = qty
+            state["step"] = "manual_confirm"
+            USER_STATES[key] = state
+            preview = (
+                f"請確認新增入庫：\n"
+                f"品名：{state['new_name']}\n"
+                f"尺寸：{state['new_size']}\n"
+                f"位置：{state['new_location']}\n"
+                f"備註：{state.get('new_remark', '') or '無'}\n"
+                f"數量：{qty}\n\n"
+                f"確認請輸入：確認"
+            )
+            reply_safe(event.reply_token, preview)
+            return
+
+        if step == "manual_confirm":
+            if user_text != "確認":
+                reply_safe(event.reply_token, "請輸入「確認」完成新增，或輸入 4 取消。")
+                return
+            append_row(
+                state["new_name"],
+                state["new_size"],
+                state["new_qty"],
+                state["new_location"],
+                state.get("new_remark", ""),
+            )
+            reset_state(key)
+            reply_safe(event.reply_token, "新增入庫完成。")
+            return
+
+        if step == "stockin_pick":
+            results = state.get("results", [])
+            idx = to_int(user_text)
+            if idx is None or idx < 1 or idx > len(results):
+                reply_safe(event.reply_token, "請輸入正確編號")
+                return
+            picked = results[idx - 1]
+            state["picked"] = picked
+            state["step"] = "stockin_qty"
+            USER_STATES[key] = state
+            reply_safe(event.reply_token, f"已選擇：{picked['name']} / 尺寸 {picked['size']} / 現有庫存 {picked['qty']}\n請輸入入庫數量")
+            return
+
+        if step == "stockin_qty":
+            qty = to_int(user_text)
+            if qty is None or qty < 0:
+                reply_safe(event.reply_token, "數量格式錯誤，請輸入整數")
+                return
+            picked = state["picked"]
+            current = to_int(picked.get("qty", "0")) or 0
+            state["qty_change"] = qty
+            state["new_total"] = current + qty
+            state["step"] = "stockin_remark"
+            USER_STATES[key] = state
+            reply_safe(event.reply_token, "請輸入備註，沒有請輸入 無")
+            return
+
+        if step == "stockin_remark":
+            remark = "" if user_text == "無" else user_text
+            state["remark"] = remark
+            state["step"] = "stockin_confirm"
+            USER_STATES[key] = state
+            picked = state["picked"]
+            preview = (
+                f"請確認入庫：\n"
+                f"品名：{picked['name']}\n"
+                f"尺寸：{picked['size']}\n"
+                f"位置：{picked['location']}\n"
+                f"原庫存：{picked['qty']}\n"
+                f"入庫：{state['qty_change']}\n"
+                f"新庫存：{state['new_total']}\n"
+                f"備註：{remark or '無'}\n\n"
+                f"確認請輸入：確認"
+            )
+            reply_safe(event.reply_token, preview)
+            return
+
+        if step == "stockin_confirm":
+            if user_text != "確認":
+                reply_safe(event.reply_token, "請輸入「確認」完成入庫，或輸入 4 取消。")
+                return
+            picked = state["picked"]
+            update_row_qty(picked["row_number"], state["new_total"], state.get("remark", ""))
+            reset_state(key)
+            reply_safe(event.reply_token, "入庫完成。")
+            return
+
+        if step == "stockout_pick":
+            results = state.get("results", [])
+            idx = to_int(user_text)
+            if idx is None or idx < 1 or idx > len(results):
+                reply_safe(event.reply_token, "請輸入正確編號")
+                return
+            picked = results[idx - 1]
+            state["picked"] = picked
+            state["step"] = "stockout_qty"
+            USER_STATES[key] = state
+            reply_safe(event.reply_token, f"已選擇：{picked['name']} / 尺寸 {picked['size']} / 現有庫存 {picked['qty']}\n請輸入出庫數量")
+            return
+
+        if step == "stockout_qty":
+            qty = to_int(user_text)
+            picked = state["picked"]
+            current = to_int(picked.get("qty", "0")) or 0
+            if qty is None or qty < 0:
+                reply_safe(event.reply_token, "數量格式錯誤，請輸入整數")
+                return
+            if qty > current:
+                reply_safe(event.reply_token, f"出庫數量不可大於現有庫存 {current}")
+                return
+            state["qty_change"] = qty
+            state["new_total"] = current - qty
+            state["step"] = "stockout_remark"
+            USER_STATES[key] = state
+            reply_safe(event.reply_token, "請輸入備註，沒有請輸入 無")
+            return
+
+        if step == "stockout_remark":
+            remark = "" if user_text == "無" else user_text
+            state["remark"] = remark
+            state["step"] = "stockout_confirm"
+            USER_STATES[key] = state
+            picked = state["picked"]
+            preview = (
+                f"請確認出庫：\n"
+                f"品名：{picked['name']}\n"
+                f"尺寸：{picked['size']}\n"
+                f"位置：{picked['location']}\n"
+                f"原庫存：{picked['qty']}\n"
+                f"出庫：{state['qty_change']}\n"
+                f"新庫存：{state['new_total']}\n"
+                f"備註：{remark or '無'}\n\n"
+                f"確認請輸入：確認"
+            )
+            reply_safe(event.reply_token, preview)
+            return
+
+        if step == "stockout_confirm":
+            if user_text != "確認":
+                reply_safe(event.reply_token, "請輸入「確認」完成出庫，或輸入 4 取消。")
+                return
+            picked = state["picked"]
+            update_row_qty(picked["row_number"], state["new_total"], state.get("remark", ""))
+            reset_state(key)
+            reply_safe(event.reply_token, "出庫完成。")
+            return
+
+        reply_safe(event.reply_token, "流程未識別，請輸入「塊材查詢」重新開始。")
+    except Exception as e:
+        print("[ERROR] handle_message failed:")
+        print(traceback.format_exc())
         try:
-            idx = int(text) - 1
-            row = sess["choices"][idx]
+            reply_safe(event.reply_token, f"系統處理失敗：{str(e)}")
         except Exception:
-            if sess.get("action") == "入庫":
-                reply(event, "請輸入正確編號，例如 1。若要手動新增請輸入 0")
-            else:
-                reply(event, "請輸入正確編號，例如 1")
-            return
-        sess.update(
-            {
-                "step": "size",
-                "item_name": row["品名"],
-                "size": row["尺寸"],
-                "location": row["位置"],
-                "note": row["備註"],
-                "qty": None,
-            }
-        )
-        set_session(key, sess)
-        reply(
-            event,
-            f"已選擇：{row['品名']}\n"
-            f"目前尺寸：{row['尺寸'] or '-'}\n"
-            f"請輸入尺寸（直接送出原尺寸也可以）",
-        )
-        return
-
-    if step == "manual_item_name":
-        sess["item_name"] = text.strip()
-        sess["step"] = "size"
-        set_session(key, sess)
-        reply(event, "請輸入尺寸")
-        return
-
-    if step == "size":
-        sess["size"] = text.strip()
-        sess["step"] = "location"
-        set_session(key, sess)
-        reply(event, "請輸入位置（不知道可輸入 - ）")
-        return
-
-    if step == "location":
-        sess["location"] = text.strip()
-        sess["step"] = "note"
-        set_session(key, sess)
-        reply(event, "有無任何需要備註？沒有請輸入 無")
-        return
-
-    if step == "note":
-        sess["note"] = text.strip()
-        sess["step"] = "qty"
-        set_session(key, sess)
-        reply(event, f"請輸入{sess['action']}數量")
-        return
-
-    if step == "qty":
-        try:
-            qty = int(text)
-            if qty <= 0:
-                raise ValueError
-        except Exception:
-            reply(event, "數量請輸入正整數，例如 5")
-            return
-        sess["qty"] = qty
-        sess["step"] = "confirm"
-        set_session(key, sess)
-        reply(
-            event,
-            f"請確認是否{sess['action']}：\n"
-            f"品名：{sess['item_name']}\n"
-            f"尺寸：{sess['size']}\n"
-            f"位置：{sess['location']}\n"
-            f"備註：{sess['note']}\n"
-            f"數量：{sess['qty']}\n\n"
-            "確認請輸入：確認\n取消請輸入：取消",
-        )
-        return
-
-    if step == "confirm":
-        if text != "確認":
-            reply(event, "請輸入【確認】完成，或輸入【取消】結束。")
-            return
-
-        action = sess["action"]
-        qty_delta = sess["qty"] if action == "入庫" else -sess["qty"]
-        try:
-            upsert_inventory(
-                sess["item_name"],
-                sess["size"],
-                qty_delta,
-                sess["location"],
-                sess["note"],
-            )
-            append_log(
-                action,
-                sess["item_name"],
-                sess["size"],
-                sess["qty"],
-                sess["location"],
-                sess["note"],
-                actor_name(event),
-            )
-        except Exception as e:
-            clear_session(key)
-            reply(event, f"處理失敗：{e}")
-            return
-
-        remain = "-"
-        for row in get_records():
-            if normalize(row["品名"]) == normalize(sess["item_name"]) and normalize(row["尺寸"]) == normalize(sess["size"]):
-                remain = row["庫存"]
-                break
-
-        clear_session(key)
-        reply(
-            event,
-            f"已完成{action}\n"
-            f"品名：{sess['item_name']}\n"
-            f"尺寸：{sess['size']}\n"
-            f"本次數量：{sess['qty']}\n"
-            f"目前庫存：{remain}",
-        )
-        return
-
-
-def handle_action_keyword(event, key: str, keyword: str):
-    sess = get_session(key) or {}
-    action = sess.get("action")
-    keyword = keyword.strip()
-
-    if not keyword:
-        reply(event, "請輸入關鍵字")
-        return
-
-    rows = search_inventory(keyword)
-
-    if action == "查詢":
-        clear_session(key)
-        reply(event, format_search_result(rows, keyword))
-        return
-
-    if action == "出庫":
-        matches = distinct_items(rows)
-        if not matches:
-            set_session(key, {"step": "action_keyword", "action": action})
-            reply(event, f"找不到【{keyword}】的資料，請重新輸入關鍵字，或輸入 取消")
-            return
-        if len(matches) == 1:
-            row = matches[0]
-            sess.update(
-                {
-                    "step": "size",
-                    "item_name": row["品名"],
-                    "size": row["尺寸"],
-                    "location": row["位置"],
-                    "note": row["備註"],
-                    "qty": None,
-                }
-            )
-            set_session(key, sess)
-            reply(event, f"已找到：{row['品名']}\n請輸入尺寸（直接送出原尺寸也可以）")
-            return
-
-        set_session(key, {"step": "choose_item", "action": action, "choices": matches})
-        lines = [f"找到 {len(matches)} 個符合【{keyword}】的品項，請回覆編號："]
-        for i, row in enumerate(matches[:15], start=1):
-            lines.append(f"{i}. {row['品名']} / 尺寸:{row['尺寸'] or '-'} / 庫存:{row['庫存']}")
-        reply(event, "\n".join(lines))
-        return
-
-    if action == "入庫":
-        matches = distinct_items(rows)
-        if not matches:
-            set_session(
-                key,
-                {
-                    "step": "no_match_inbound_decision",
-                    "action": action,
-                    "keyword": keyword,
-                    "item_name": keyword,
-                    "size": "",
-                    "location": "",
-                    "note": "",
-                    "qty": None,
-                },
-            )
-            reply(
-                event,
-                f"找不到【{keyword}】現有編號。\n"
-                "1. 手動新增\n"
-                "2. 重新輸入關鍵字\n\n"
-                "請輸入 1 或 2",
-            )
-            return
-
-        if len(matches) == 1:
-            row = matches[0]
-            sess.update(
-                {
-                    "step": "size",
-                    "item_name": row["品名"],
-                    "size": row["尺寸"],
-                    "location": row["位置"],
-                    "note": row["備註"],
-                    "qty": None,
-                }
-            )
-            set_session(key, sess)
-            reply(event, f"已找到：{row['品名']}\n請輸入尺寸（直接送出原尺寸也可以）")
-            return
-
-        set_session(key, {"step": "choose_item", "action": action, "choices": matches})
-        lines = [f"找到 {len(matches)} 個符合【{keyword}】的品項，請回覆編號："]
-        for i, row in enumerate(matches[:15], start=1):
-            lines.append(f"{i}. {row['品名']} / 尺寸:{row['尺寸'] or '-'} / 庫存:{row['庫存']}")
-        lines.append("若沒有要的品項，請輸入 0 手動新增")
-        reply(event, "\n".join(lines))
-        return
+            pass
 
 
 if __name__ == "__main__":
