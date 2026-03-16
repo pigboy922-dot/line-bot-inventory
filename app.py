@@ -4,7 +4,8 @@ from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.models import (
     MessageEvent, TextMessage, TextSendMessage,
-    TemplateSendMessage, ButtonsTemplate, MessageTemplateAction
+    TemplateSendMessage, ButtonsTemplate, MessageTemplateAction,
+    CarouselTemplate, CarouselColumn
 )
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -31,7 +32,7 @@ sheet = gc.open_by_key(os.getenv("GOOGLE_SHEET_ID")).sheet1
 # 使用者狀態
 user_state = {}
 
-# 暫存使用者操作資料
+# 暫存使用者資料
 user_data = {}
 
 
@@ -60,10 +61,20 @@ def handle_message(event):
     print("目前狀態：", user_state.get(user_id))
     print("暫存資料：", user_data.get(user_id))
 
-    # 通用取消
+    # 取消
     if user_text == "取消":
         clear_user_session(user_id)
         reply_text(event.reply_token, "已取消操作，請輸入「塊材查詢」開啟選單")
+        return
+
+    # 直接出庫格式：直接出庫::列號
+    if user_text.startswith("直接出庫::"):
+        try:
+            row_number = int(user_text.split("::")[1])
+            start_direct_out(event.reply_token, user_id, row_number)
+        except Exception as e:
+            print("direct out parse error:", e)
+            reply_text(event.reply_token, "出庫資料錯誤，請重新查詢")
         return
 
     # 主選單
@@ -95,12 +106,6 @@ def handle_message(event):
         reply_text(event.reply_token, "請輸入要出庫的品名或尺寸關鍵字")
         return
 
-    elif user_text == "要出庫":
-        clear_user_session(user_id)
-        user_state[user_id] = "waiting_out_keyword"
-        reply_text(event.reply_token, "請輸入要出庫的品名或尺寸關鍵字")
-        return
-
     elif user_text == "返回選單":
         clear_user_session(user_id)
         send_menu(event.reply_token)
@@ -113,12 +118,12 @@ def handle_message(event):
         reply_text(event.reply_token, "請輸入品名")
         return
 
-    # ===== 查詢流程 =====
+    # 查詢流程
     if user_state.get(user_id) == "waiting_search_keyword":
         search_stock(event.reply_token, user_id, user_text)
         return
 
-    # ===== 入庫流程 =====
+    # 入庫流程
     if user_state.get(user_id) == "waiting_in_keyword":
         search_stock_for_in(event.reply_token, user_id, user_text)
         return
@@ -131,7 +136,7 @@ def handle_message(event):
         process_in_qty(event.reply_token, user_id, user_text)
         return
 
-    # ===== 出庫流程 =====
+    # 出庫流程
     if user_state.get(user_id) == "waiting_out_keyword":
         search_stock_for_out(event.reply_token, user_id, user_text)
         return
@@ -144,7 +149,7 @@ def handle_message(event):
         process_out_qty(event.reply_token, user_id, user_text)
         return
 
-    # ===== 手動入庫流程 =====
+    # 手動入庫流程
     if user_state.get(user_id) == "manual_in_name":
         user_data[user_id]["品名"] = user_text
         user_state[user_id] = "manual_in_size"
@@ -161,7 +166,11 @@ def handle_message(event):
         if not is_valid_int(user_text):
             reply_text(event.reply_token, "數量請輸入整數")
             return
-        user_data[user_id]["數量"] = int(user_text)
+        qty = int(user_text)
+        if qty <= 0:
+            reply_text(event.reply_token, "數量必須大於 0")
+            return
+        user_data[user_id]["數量"] = qty
         user_state[user_id] = "manual_in_loc"
         reply_text(event.reply_token, "請輸入位置")
         return
@@ -171,7 +180,6 @@ def handle_message(event):
         save_manual_stock(event.reply_token, user_id)
         return
 
-    # 其他
     reply_text(event.reply_token, "請輸入「塊材查詢」開啟選單")
 
 
@@ -228,7 +236,7 @@ def search_stock(reply_token, user_id, keyword):
             return
 
         lines = []
-        for item in matches[:20]:
+        for item in matches[:10]:
             lines.append(
                 f"{item['row_number']}. {item['品名']} / {item['尺寸']} / 數量:{item['數量']} / 位置:{item['位置']}"
             )
@@ -239,25 +247,79 @@ def search_stock(reply_token, user_id, keyword):
 
         clear_user_session(user_id)
 
-        line_bot_api.reply_message(reply_token, [
-            TextSendMessage(text=msg),
-            TemplateSendMessage(
-                alt_text='查詢完成選單',
-                template=ButtonsTemplate(
-                    title='查詢完成',
-                    text='是否要直接進行出庫？',
+        messages = [TextSendMessage(text=msg)]
+
+        columns = []
+        for item in matches[:10]:
+            title = str(item['品名'])[:40] if item['品名'] else "庫存資料"
+            text = f"{item['尺寸']}\n數量:{item['數量']} / 位置:{item['位置']}"
+            text = text[:60]
+
+            columns.append(
+                CarouselColumn(
+                    title=title,
+                    text=text,
                     actions=[
-                        MessageTemplateAction(label='要出庫', text='要出庫'),
-                        MessageTemplateAction(label='返回選單', text='返回選單')
+                        MessageTemplateAction(
+                            label='出庫',
+                            text=f"直接出庫::{item['row_number']}"
+                        )
                     ]
                 )
             )
-        ])
+
+        messages.append(
+            TemplateSendMessage(
+                alt_text='搜尋結果出庫選單',
+                template=CarouselTemplate(columns=columns)
+            )
+        )
+
+        line_bot_api.reply_message(reply_token, messages)
 
     except Exception as e:
         print("search_stock error:", e)
         clear_user_session(user_id)
         reply_text(reply_token, f"查詢失敗：{str(e)}")
+
+
+def start_direct_out(reply_token, user_id, row_number):
+    try:
+        data = sheet.get_all_records()
+
+        target = None
+        for idx, row in enumerate(data, start=2):
+            if idx == row_number:
+                target = {
+                    "row_number": idx,
+                    "品名": str(row.get("品名", "")).strip(),
+                    "尺寸": str(row.get("尺寸", "")).strip(),
+                    "數量": to_int(row.get("數量", 0)),
+                    "位置": str(row.get("位置", "")).strip()
+                }
+                break
+
+        if not target:
+            clear_user_session(user_id)
+            reply_text(reply_token, "找不到該筆資料，請重新查詢")
+            return
+
+        user_data[user_id] = {
+            "selected_item": target
+        }
+        user_state[user_id] = "waiting_out_qty"
+
+        reply_text(
+            reply_token,
+            f"已選擇出庫：\n"
+            f"{target['品名']} / {target['尺寸']} / 目前數量:{target['數量']} / 位置:{target['位置']}\n\n"
+            f"請直接輸入要扣除的數量"
+        )
+
+    except Exception as e:
+        print("start_direct_out error:", e)
+        clear_user_session(user_id)
+        reply_text(reply_token, f"出庫操作失敗：{str(e)}")
 
 
 def search_stock_for_in(reply_token, user_id, keyword):
@@ -537,16 +599,13 @@ def find_matching_rows(keyword):
     keyword = str(keyword).strip().lower()
 
     result = []
-    for idx, row in enumerate(data, start=2):  # 第1列為標題
+    for idx, row in enumerate(data, start=2):
         name = str(row.get("品名", "")).strip()
         size = str(row.get("尺寸", "")).strip()
         qty = row.get("數量", 0)
         loc = str(row.get("位置", "")).strip()
 
-        name_lower = name.lower()
-        size_lower = size.lower()
-
-        if keyword in name_lower or keyword in size_lower:
+        if keyword in name.lower() or keyword in size.lower():
             result.append({
                 "row_number": idx,
                 "品名": name,
