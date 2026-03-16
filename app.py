@@ -1,10 +1,10 @@
 import os
+import json
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
-from linebot.models import *
+from linebot.models import MessageEvent, TextMessage, TextSendMessage, TemplateSendMessage, ButtonsTemplate, MessageTemplateAction
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-import json
 
 app = Flask(__name__)
 
@@ -14,7 +14,6 @@ LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# Google Sheet
 scope = [
     "https://spreadsheets.google.com/feeds",
     "https://www.googleapis.com/auth/drive"
@@ -29,35 +28,47 @@ sheet = gc.open_by_key(os.getenv("GOOGLE_SHEET_ID")).sheet1
 
 @app.route("/callback", methods=['POST'])
 def callback():
-    signature = request.headers['X-Line-Signature']
+    signature = request.headers.get('X-Line-Signature')
     body = request.get_data(as_text=True)
 
-    handler.handle(body, signature)
+    print("Request body:", body)
+
+    try:
+        handler.handle(body, signature)
+    except Exception as e:
+        print("callback error:", e)
+        abort(400)
+
     return 'OK'
 
 
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
-    user_text = event.message.text.strip()
+    user_text = str(event.message.text).strip()
 
     if user_text == "塊材查詢":
         send_menu(event.reply_token)
         return
 
-    if user_text == "查詢庫存":
+    elif user_text == "查詢庫存":
         reply_text(event.reply_token, "請輸入關鍵字，例如 503")
+        return
 
     elif user_text == "全部庫存":
         show_all_stock(event.reply_token)
+        return
 
     elif user_text == "入庫":
         reply_text(event.reply_token, "請輸入要入庫的品名關鍵字")
+        return
 
     elif user_text == "出庫":
         reply_text(event.reply_token, "請輸入要出庫的品名關鍵字")
+        return
 
     else:
         search_stock(event.reply_token, user_text)
+        return
 
 
 def send_menu(reply_token):
@@ -78,36 +89,48 @@ def send_menu(reply_token):
 
 
 def show_all_stock(reply_token):
-    data = sheet.get_all_records()
-    msg = "全部塊材庫存：\n"
+    try:
+        data = sheet.get_all_records()
+        msg = "全部塊材庫存：\n"
 
-    for row in data[:40]:
-        msg += f"{row['品名']} / {row['尺寸']} / 數量:{row['數量']} / 位置:{row['位置']}\n"
+        for row in data[:40]:
+            msg += f"{row.get('品名','')} / {row.get('尺寸','')} / 數量:{row.get('數量','')} / 位置:{row.get('位置','')}\n"
 
-    line_bot_api.reply_message(reply_token, TextSendMessage(msg))
+        line_bot_api.reply_message(reply_token, TextSendMessage(text=msg))
+    except Exception as e:
+        print("show_all_stock error:", e)
+        line_bot_api.reply_message(reply_token, TextSendMessage(text=f"讀取失敗：{str(e)}"))
 
 
 def search_stock(reply_token, keyword):
-    data = sheet.get_all_records()
+    try:
+        data = sheet.get_all_records()
+        keyword = str(keyword).strip().lower()
 
-    result = []
-    for row in data:
-        if keyword.lower() in row["品名"].lower():
-            result.append(row)
+        result = []
+        for row in data:
+            name = str(row.get("品名", "")).strip().lower()
+            size = str(row.get("尺寸", "")).strip()
+            qty = str(row.get("數量", "")).strip()
+            loc = str(row.get("位置", "")).strip()
 
-    if not result:
-        line_bot_api.reply_message(reply_token, TextSendMessage("找不到相關品名"))
-        return
+            if keyword in name:
+                result.append(f"{row.get('品名', '')} / {size} / 數量:{qty} / 位置:{loc}")
 
-    msg = "搜尋結果：\n"
-    for r in result:
-        msg += f"{r['品名']} / {r['尺寸']} / 數量:{r['數量']} / 位置:{r['位置']}\n"
+        if not result:
+            line_bot_api.reply_message(reply_token, TextSendMessage(text="找不到相關品名"))
+            return
 
-    line_bot_api.reply_message(reply_token, TextSendMessage(msg))
+        msg = "搜尋結果：\n" + "\n".join(result[:20])
+        line_bot_api.reply_message(reply_token, TextSendMessage(text=msg))
+
+    except Exception as e:
+        print("search_stock error:", e)
+        line_bot_api.reply_message(reply_token, TextSendMessage(text=f"查詢失敗：{str(e)}"))
 
 
 def reply_text(reply_token, text):
-    line_bot_api.reply_message(reply_token, TextSendMessage(text))
+    line_bot_api.reply_message(reply_token, TextSendMessage(text=text))
 
 
 if __name__ == "__main__":
