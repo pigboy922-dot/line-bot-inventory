@@ -171,7 +171,7 @@ def handle_message(event):
         user_state[user_id] = "waiting_search_keyword"
         reply_text(
             event.reply_token,
-            "請輸入品名或尺寸關鍵字，例如：例如 KF-0030N 509 BDP-1，只要輸入 509 即可查詢"
+            "請輸入品名或尺寸關鍵字，例如 KF-0030N 509 BDP-1，只要輸入 509 即可查詢"
         )
         return
     elif user_text == "全部庫存":
