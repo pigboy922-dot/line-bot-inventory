@@ -75,12 +75,21 @@ def callback():
 
 def get_user_key(event):
     source = event.source
-    if hasattr(source, "user_id") and source.user_id:
-        return source.user_id
-    if hasattr(source, "group_id") and source.group_id:
-        return f"group_{source.group_id}"
-    if hasattr(source, "room_id") and source.room_id:
-        return f"room_{source.room_id}"
+
+    group_id = getattr(source, "group_id", None)
+    room_id = getattr(source, "room_id", None)
+    user_id = getattr(source, "user_id", None)
+
+    if group_id and user_id:
+        return f"group_{group_id}_user_{user_id}"
+    if room_id and user_id:
+        return f"room_{room_id}_user_{user_id}"
+    if user_id:
+        return f"user_{user_id}"
+    if group_id:
+        return f"group_{group_id}"
+    if room_id:
+        return f"room_{room_id}"
     return "unknown_user"
 
 
@@ -95,10 +104,7 @@ def handle_message(event):
 
     current_state = user_state.get(user_id)
 
-    # -------------------------
-    # 安靜版核心：
-    # 若目前沒有流程狀態，且不是啟動指令，就不回應
-    # -------------------------
+    # 安靜版核心：若目前沒有流程狀態，且不是啟動指令，就不回應
     allowed_idle_commands = {
         "塊材查詢",
         "取消",
@@ -163,7 +169,10 @@ def handle_message(event):
     elif user_text == "查詢庫存":
         clear_user_session(user_id)
         user_state[user_id] = "waiting_search_keyword"
-        reply_text(event.reply_token, "請輸入關鍵字，例如 503")
+        reply_text(
+            event.reply_token,
+            "請輸入品名或尺寸關鍵字，例如：509\n例如 KF-0030N 509 BDP-1，只要輸入 509 即可查詢"
+        )
         return
     elif user_text == "全部庫存":
         clear_user_session(user_id)
@@ -242,7 +251,6 @@ def handle_message(event):
         save_manual_stock(event.reply_token, user_id)
         return
 
-    # 安靜版：其餘情況不回應
     return
 
 
@@ -256,7 +264,7 @@ def send_menu(reply_token):
         alt_text="塊材選單",
         template=ButtonsTemplate(
             title="塊材管理",
-            text="請選擇功能",
+            text="請選擇功能\n查詢例如：KF-0030N 509 BDP-1\n只需輸入：509",
             actions=[
                 MessageTemplateAction(label="查詢庫存", text="查詢庫存"),
                 MessageTemplateAction(label="入庫", text="入庫"),
