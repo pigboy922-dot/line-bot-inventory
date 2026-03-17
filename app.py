@@ -46,6 +46,9 @@ user_state = {}
 # 暫存使用者資料
 user_data = {}
 
+# 全部庫存每頁筆數
+PAGE_SIZE = 10
+
 
 @app.route("/", methods=["GET"])
 def home():
@@ -118,6 +121,17 @@ def handle_message(event):
             reply_text(event.reply_token, "入庫資料錯誤，請重新查詢")
         return
 
+    # 全部庫存分頁格式：全部庫存::頁碼
+    if user_text.startswith("全部庫存::"):
+        try:
+            page = int(user_text.split("::")[1])
+            clear_user_session(user_id)
+            show_all_stock(event.reply_token, page=page)
+        except Exception as e:
+            print("stock page parse error:", e)
+            reply_text(event.reply_token, "頁碼錯誤，請重新操作")
+        return
+
     # 主選單
     if user_text == "塊材查詢":
         clear_user_session(user_id)
@@ -132,7 +146,7 @@ def handle_message(event):
 
     elif user_text == "全部庫存":
         clear_user_session(user_id)
-        show_all_stock(event.reply_token)
+        show_all_stock(event.reply_token, page=1)
         return
 
     elif user_text == "入庫":
@@ -243,21 +257,73 @@ def send_menu(reply_token):
     line_bot_api.reply_message(reply_token, buttons)
 
 
-def show_all_stock(reply_token):
+def show_all_stock(reply_token, page=1):
     try:
         data = sheet.get_all_records()
         if not data:
             reply_text(reply_token, "目前沒有資料")
             return
 
-        msg = "全部塊材庫存：\n"
-        for row in data[:40]:
-            msg += f"{row.get('品名', '')} / {row.get('尺寸', '')} / 數量:{row.get('數量', '')} / 位置:{row.get('位置', '')}\n"
+        total_count = len(data)
+        total_pages = (total_count + PAGE_SIZE - 1) // PAGE_SIZE
 
+        if total_pages <= 0:
+            total_pages = 1
+
+        if page < 1:
+            page = 1
+        if page > total_pages:
+            page = total_pages
+
+        start_idx = (page - 1) * PAGE_SIZE
+        end_idx = start_idx + PAGE_SIZE
+        display_rows = data[start_idx:end_idx]
+
+        lines = [f"全部塊材庫存（第 {page}/{total_pages} 頁，共 {total_count} 筆）\n"]
+
+        for i, row in enumerate(display_rows, start=start_idx + 1):
+            lines.append(
+                f"{i}.\n"
+                f"品名：{row.get('品名', '')}\n"
+                f"尺寸：{row.get('尺寸', '')}\n"
+                f"數量：{row.get('數量', '')}\n"
+                f"位置：{row.get('位置', '')}\n"
+            )
+
+        msg = "\n".join(lines)
         if len(msg) > 4500:
             msg = msg[:4500]
 
-        reply_text(reply_token, msg)
+        actions = []
+
+        if page > 1:
+            actions.append(
+                MessageTemplateAction(label="上一頁", text=f"全部庫存::{page - 1}")
+            )
+
+        if page < total_pages:
+            actions.append(
+                MessageTemplateAction(label="下一頁", text=f"全部庫存::{page + 1}")
+            )
+
+        actions.append(
+            MessageTemplateAction(label="返回選單", text="返回選單")
+        )
+
+        messages = [TextSendMessage(text=msg)]
+
+        messages.append(
+            TemplateSendMessage(
+                alt_text="全部庫存分頁",
+                template=ButtonsTemplate(
+                    title="庫存分頁",
+                    text=f"目前第 {page}/{total_pages} 頁",
+                    actions=actions[:4]
+                )
+            )
+        )
+
+        line_bot_api.reply_message(reply_token, messages)
 
     except Exception as e:
         print("show_all_stock error:", e)
@@ -464,7 +530,17 @@ def search_stock_for_in(reply_token, user_id, keyword):
             )
 
         messages.append(
-            TextSendMessage(text="若都不是，請輸入：手動入庫\n取消請輸入：取消")
+            TemplateSendMessage(
+                alt_text="其他操作",
+                template=ButtonsTemplate(
+                    title="其他操作",
+                    text="若上面都不是，請選擇",
+                    actions=[
+                        MessageTemplateAction(label="手動入庫", text="手動入庫"),
+                        MessageTemplateAction(label="取消", text="取消")
+                    ]
+                )
+            )
         )
 
         line_bot_api.reply_message(reply_token, messages)
