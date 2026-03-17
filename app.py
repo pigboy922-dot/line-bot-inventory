@@ -7,27 +7,38 @@ from linebot.models import (
     TemplateSendMessage, ButtonsTemplate, MessageTemplateAction,
     CarouselTemplate, CarouselColumn
 )
+from linebot.exceptions import InvalidSignatureError
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+from google.oauth2.service_account import Credentials
 
 app = Flask(__name__)
 
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
+GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
+
+if not LINE_CHANNEL_SECRET:
+    raise ValueError("缺少環境變數 LINE_CHANNEL_SECRET")
+if not LINE_CHANNEL_ACCESS_TOKEN:
+    raise ValueError("缺少環境變數 LINE_CHANNEL_ACCESS_TOKEN")
+if not GOOGLE_CREDENTIALS_JSON:
+    raise ValueError("缺少環境變數 GOOGLE_CREDENTIALS_JSON")
+if not GOOGLE_SHEET_ID:
+    raise ValueError("缺少環境變數 GOOGLE_SHEET_ID")
 
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
 scope = [
-    "https://spreadsheets.google.com/feeds",
+    "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive"
 ]
 
-creds_json = json.loads(os.getenv("GOOGLE_CREDENTIALS_JSON"))
-creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_json, scope)
-gc = gspread.authorize(creds)
-
-sheet = gc.open_by_key(os.getenv("GOOGLE_SHEET_ID")).sheet1
+creds_info = json.loads(GOOGLE_CREDENTIALS_JSON)
+credentials = Credentials.from_service_account_info(creds_info, scopes=scope)
+gc = gspread.authorize(credentials)
+sheet = gc.open_by_key(GOOGLE_SHEET_ID).sheet1
 
 # 使用者狀態
 user_state = {}
@@ -36,32 +47,46 @@ user_state = {}
 user_data = {}
 
 
-# Render / UptimeRobot / 外部監控用首頁
 @app.route("/", methods=["GET"])
 def home():
     return "LINE BOT Running", 200
 
 
-@app.route("/callback", methods=['POST'])
+@app.route("/callback", methods=["POST"])
 def callback():
-    signature = request.headers.get('X-Line-Signature')
+    signature = request.headers.get("X-Line-Signature", "")
     body = request.get_data(as_text=True)
 
     print("Request body:", body)
 
     try:
         handler.handle(body, signature)
+    except InvalidSignatureError:
+        print("Invalid signature")
+        abort(400)
     except Exception as e:
         print("callback error:", e)
         abort(400)
 
-    return 'OK'
+    return "OK"
+
+
+def get_user_key(event):
+    source = event.source
+
+    if hasattr(source, "user_id") and source.user_id:
+        return source.user_id
+    if hasattr(source, "group_id") and source.group_id:
+        return f"group_{source.group_id}"
+    if hasattr(source, "room_id") and source.room_id:
+        return f"room_{source.room_id}"
+    return "unknown_user"
 
 
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     user_text = str(event.message.text).strip()
-    user_id = event.source.user_id
+    user_id = get_user_key(event)
 
     print("收到訊息：", user_text)
     print("目前狀態：", user_state.get(user_id))
@@ -81,6 +106,16 @@ def handle_message(event):
         except Exception as e:
             print("direct out parse error:", e)
             reply_text(event.reply_token, "出庫資料錯誤，請重新查詢")
+        return
+
+    # 直接入庫格式：直接入庫::列號
+    if user_text.startswith("直接入庫::"):
+        try:
+            row_number = int(user_text.split("::")[1])
+            start_direct_in(event.reply_token, user_id, row_number)
+        except Exception as e:
+            print("direct in parse error:", e)
+            reply_text(event.reply_token, "入庫資料錯誤，請重新查詢")
         return
 
     # 主選單
@@ -134,10 +169,6 @@ def handle_message(event):
         search_stock_for_in(event.reply_token, user_id, user_text)
         return
 
-    elif user_state.get(user_id) == "waiting_in_select":
-        process_in_select(event.reply_token, user_id, user_text)
-        return
-
     elif user_state.get(user_id) == "waiting_in_qty":
         process_in_qty(event.reply_token, user_id, user_text)
         return
@@ -172,10 +203,12 @@ def handle_message(event):
         if not is_valid_int(user_text):
             reply_text(event.reply_token, "數量請輸入整數")
             return
+
         qty = int(user_text)
         if qty <= 0:
             reply_text(event.reply_token, "數量必須大於 0")
             return
+
         user_data[user_id]["數量"] = qty
         user_state[user_id] = "manual_in_loc"
         reply_text(event.reply_token, "請輸入位置")
@@ -196,15 +229,14 @@ def clear_user_session(user_id):
 
 def send_menu(reply_token):
     buttons = TemplateSendMessage(
-        alt_text='塊材選單',
+        alt_text="塊材選單",
         template=ButtonsTemplate(
-            title='塊材管理',
-            text='請選擇功能',
+            title="塊材管理",
+            text="請選擇功能",
             actions=[
-                MessageTemplateAction(label='查詢庫存', text='查詢庫存'),
-                MessageTemplateAction(label='入庫', text='入庫'),
-                MessageTemplateAction(label='出庫', text='出庫'),
-                MessageTemplateAction(label='全部庫存', text='全部庫存')
+                MessageTemplateAction(label="查詢庫存", text="查詢庫存"),
+                MessageTemplateAction(label="入庫", text="入庫"),
+                MessageTemplateAction(label="全部庫存", text="全部庫存")
             ]
         )
     )
@@ -257,7 +289,7 @@ def search_stock(reply_token, user_id, keyword):
 
         columns = []
         for item in matches[:10]:
-            title = str(item['品名'])[:40] if item['品名'] else "庫存資料"
+            title = str(item["品名"])[:40] if item["品名"] else "庫存資料"
             text = f"{item['尺寸']}\n數量:{item['數量']} / 位置:{item['位置']}"
             text = text[:60]
 
@@ -267,19 +299,20 @@ def search_stock(reply_token, user_id, keyword):
                     text=text,
                     actions=[
                         MessageTemplateAction(
-                            label='出庫',
+                            label="出庫",
                             text=f"直接出庫::{item['row_number']}"
                         )
                     ]
                 )
             )
 
-        messages.append(
-            TemplateSendMessage(
-                alt_text='搜尋結果出庫選單',
-                template=CarouselTemplate(columns=columns)
+        if columns:
+            messages.append(
+                TemplateSendMessage(
+                    alt_text="搜尋結果出庫選單",
+                    template=CarouselTemplate(columns=columns)
+                )
             )
-        )
 
         line_bot_api.reply_message(reply_token, messages)
 
@@ -287,6 +320,45 @@ def search_stock(reply_token, user_id, keyword):
         print("search_stock error:", e)
         clear_user_session(user_id)
         reply_text(reply_token, f"查詢失敗：{str(e)}")
+
+
+def start_direct_in(reply_token, user_id, row_number):
+    try:
+        data = sheet.get_all_records()
+
+        target = None
+        for idx, row in enumerate(data, start=2):
+            if idx == row_number:
+                target = {
+                    "row_number": idx,
+                    "品名": str(row.get("品名", "")).strip(),
+                    "尺寸": str(row.get("尺寸", "")).strip(),
+                    "數量": to_int(row.get("數量", 0)),
+                    "位置": str(row.get("位置", "")).strip()
+                }
+                break
+
+        if not target:
+            clear_user_session(user_id)
+            reply_text(reply_token, "找不到該筆資料，請重新查詢")
+            return
+
+        user_data[user_id] = {
+            "selected_item": target
+        }
+        user_state[user_id] = "waiting_in_qty"
+
+        reply_text(
+            reply_token,
+            f"已選擇入庫：\n"
+            f"{target['品名']} / {target['尺寸']} / 目前數量:{target['數量']} / 位置:{target['位置']}\n\n"
+            f"請直接輸入要增加的數量"
+        )
+
+    except Exception as e:
+        print("start_direct_in error:", e)
+        clear_user_session(user_id)
+        reply_text(reply_token, f"入庫操作失敗：{str(e)}")
 
 
 def start_direct_out(reply_token, user_id, row_number):
@@ -337,76 +409,70 @@ def search_stock_for_in(reply_token, user_id, keyword):
             line_bot_api.reply_message(reply_token, [
                 TextSendMessage(text="找不到相關品名"),
                 TemplateSendMessage(
-                    alt_text='手動入庫選單',
+                    alt_text="手動入庫選單",
                     template=ButtonsTemplate(
-                        title='找不到品名',
-                        text='是否要手動入庫？',
+                        title="找不到品名",
+                        text="是否要手動入庫？",
                         actions=[
-                            MessageTemplateAction(label='手動入庫', text='手動入庫'),
-                            MessageTemplateAction(label='返回選單', text='返回選單')
+                            MessageTemplateAction(label="手動入庫", text="手動入庫"),
+                            MessageTemplateAction(label="返回選單", text="返回選單")
                         ]
                     )
                 )
             ])
             return
 
-        user_data[user_id] = {
-            "matches": matches
-        }
-        user_state[user_id] = "waiting_in_select"
+        clear_user_session(user_id)
 
-        msg = "以下為可入庫品項：\n"
-        for i, item in enumerate(matches[:15], start=1):
-            msg += f"{i}. {item['品名']} / {item['尺寸']} / 目前數量:{item['數量']} / 位置:{item['位置']}\n"
-        msg += "\n請輸入要入庫的編號"
-        msg += "\n若都不是，請輸入：手動入庫"
-        msg += "\n取消請輸入：取消"
+        lines = []
+        for item in matches[:10]:
+            lines.append(
+                f"{item['row_number']}. {item['品名']} / {item['尺寸']} / 目前數量:{item['數量']} / 位置:{item['位置']}"
+            )
 
+        msg = "以下為可入庫品項：\n" + "\n".join(lines)
         if len(msg) > 4500:
             msg = msg[:4500]
 
-        reply_text(reply_token, msg)
+        messages = [TextSendMessage(text=msg)]
+
+        columns = []
+        for item in matches[:10]:
+            title = str(item["品名"])[:40] if item["品名"] else "庫存資料"
+            text = f"{item['尺寸']}\n數量:{item['數量']} / 位置:{item['位置']}"
+            text = text[:60]
+
+            columns.append(
+                CarouselColumn(
+                    title=title,
+                    text=text,
+                    actions=[
+                        MessageTemplateAction(
+                            label="入庫",
+                            text=f"直接入庫::{item['row_number']}"
+                        )
+                    ]
+                )
+            )
+
+        if columns:
+            messages.append(
+                TemplateSendMessage(
+                    alt_text="入庫選單",
+                    template=CarouselTemplate(columns=columns)
+                )
+            )
+
+        messages.append(
+            TextSendMessage(text="若都不是，請輸入：手動入庫\n取消請輸入：取消")
+        )
+
+        line_bot_api.reply_message(reply_token, messages)
 
     except Exception as e:
         print("search_stock_for_in error:", e)
         clear_user_session(user_id)
         reply_text(reply_token, f"入庫查詢失敗：{str(e)}")
-
-
-def process_in_select(reply_token, user_id, user_text):
-    try:
-        if user_text == "手動入庫":
-            user_data[user_id] = {}
-            user_state[user_id] = "manual_in_name"
-            reply_text(reply_token, "請輸入品名")
-            return
-
-        if not is_valid_int(user_text):
-            reply_text(reply_token, "請輸入正確編號")
-            return
-
-        selected_index = int(user_text) - 1
-        matches = user_data.get(user_id, {}).get("matches", [])
-
-        if selected_index < 0 or selected_index >= len(matches):
-            reply_text(reply_token, "編號超出範圍，請重新輸入")
-            return
-
-        selected_item = matches[selected_index]
-        user_data[user_id]["selected_item"] = selected_item
-        user_state[user_id] = "waiting_in_qty"
-
-        reply_text(
-            reply_token,
-            f"你選擇的是：\n"
-            f"{selected_item['品名']} / {selected_item['尺寸']} / 目前數量:{selected_item['數量']} / 位置:{selected_item['位置']}\n\n"
-            f"請輸入入庫數量"
-        )
-
-    except Exception as e:
-        print("process_in_select error:", e)
-        clear_user_session(user_id)
-        reply_text(reply_token, f"入庫選擇失敗：{str(e)}")
 
 
 def process_in_qty(reply_token, user_id, user_text):
@@ -649,7 +715,7 @@ def is_valid_int(text):
 
 
 def reply_text(reply_token, text):
-    line_bot_api.reply_message(reply_token, TextSendMessage(text=text))
+    line_bot_api.reply_message(reply_token, TextSendMessage(text=str(text)[:5000]))
 
 
 if __name__ == "__main__":
