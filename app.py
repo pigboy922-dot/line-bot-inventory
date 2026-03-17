@@ -36,6 +36,12 @@ user_state = {}
 user_data = {}
 
 
+# Render / UptimeRobot / 外部監控用首頁
+@app.route("/", methods=["GET"])
+def home():
+    return "LINE BOT Running", 200
+
+
 @app.route("/callback", methods=['POST'])
 def callback():
     signature = request.headers.get('X-Line-Signature')
