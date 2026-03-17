@@ -69,7 +69,6 @@ def handle_message(event):
     user_id = get_user_key(event)
 
     print("訊息:", user_text)
-    print("狀態:", user_state.get(user_id))
 
     # ===== 取消 =====
     if user_text == "取消":
@@ -83,7 +82,7 @@ def handle_message(event):
         send_menu(event.reply_token)
         return
 
-    # ===== 功能選單 =====
+    # ===== 功能 =====
     if user_text == "查詢庫存":
         user_state[user_id] = "search"
         reply_text(event.reply_token, "請輸入關鍵字")
@@ -133,15 +132,9 @@ def handle_message(event):
         process_out_qty(event.reply_token, user_id, user_text)
         return
 
-    # ===== 手動入庫 =====
+    # ===== 手動入庫（重點🔥）=====
     if user_state.get(user_id) == "manual_name":
         user_data[user_id]["品名"] = user_text
-        user_state[user_id] = "manual_size"
-        reply_text(event.reply_token, "請輸入尺寸")
-        return
-
-    if user_state.get(user_id) == "manual_size":
-        user_data[user_id]["尺寸"] = user_text
         user_state[user_id] = "manual_qty"
         reply_text(event.reply_token, "請輸入數量")
         return
@@ -150,6 +143,7 @@ def handle_message(event):
         if not user_text.isdigit():
             reply_text(event.reply_token, "請輸入數字")
             return
+
         user_data[user_id]["數量"] = int(user_text)
         user_state[user_id] = "manual_loc"
         reply_text(event.reply_token, "請輸入位置")
@@ -160,7 +154,7 @@ def handle_message(event):
         save_manual_stock(event.reply_token, user_id)
         return
 
-    # ❌ 其它全部不回應
+    # ❌ 其它不回應
     return
 
 
@@ -187,12 +181,11 @@ def send_menu(token):
 def show_all_stock(token, page):
     data = sheet.get_all_records()
     start = (page - 1) * PAGE_SIZE
-    end = start + PAGE_SIZE
-    rows = data[start:end]
+    rows = data[start:start + PAGE_SIZE]
 
     msg = f"庫存（第{page}頁）\n\n"
     for i, r in enumerate(rows, start=start + 1):
-        msg += f"{i}. {r['品名']} / {r['尺寸']} / {r['數量']}\n"
+        msg += f"{i}. {r['品名']} / {r['數量']} / {r['位置']}\n"
 
     reply_text(token, msg)
 
@@ -202,8 +195,8 @@ def search_stock(token, keyword):
     msg = "搜尋結果：\n"
 
     for i, r in enumerate(data, start=2):
-        if keyword in str(r['品名']) or keyword in str(r['尺寸']):
-            msg += f"{i}. {r['品名']} / {r['尺寸']} / {r['數量']}\n"
+        if keyword in str(r['品名']):
+            msg += f"{i}. {r['品名']} / {r['數量']} / {r['位置']}\n"
 
     reply_text(token, msg)
 
@@ -212,13 +205,13 @@ def search_stock_for_in(token, user_id, keyword):
     data = sheet.get_all_records()
 
     for i, r in enumerate(data, start=2):
-        if keyword in str(r['品名']) or keyword in str(r['尺寸']):
+        if keyword in str(r['品名']):
             user_data[user_id] = {"row": i}
             user_state[user_id] = "in_qty"
             reply_text(token, f"{r['品名']} 目前:{r['數量']}，輸入入庫數量")
             return
 
-    reply_text(token, "找不到資料，可使用『手動入庫』")
+    reply_text(token, "找不到資料，可用手動入庫")
 
 
 def process_in_qty(token, user_id, qty):
@@ -242,7 +235,7 @@ def search_stock_for_out(token, user_id, keyword):
     data = sheet.get_all_records()
 
     for i, r in enumerate(data, start=2):
-        if keyword in str(r['品名']) or keyword in str(r['尺寸']):
+        if keyword in str(r['品名']):
             user_data[user_id] = {"row": i}
             user_state[user_id] = "out_qty"
             reply_text(token, f"{r['品名']} 目前:{r['數量']}，輸入出庫數量")
@@ -273,20 +266,37 @@ def process_out_qty(token, user_id, qty):
     clear_user_session(user_id)
 
 
+# ⭐ 手動入庫（自動合併🔥）
 def save_manual_stock(token, user_id):
     item = user_data[user_id]
+    name = item["品名"]
+    qty = item["數量"]
+    loc = item["位置"]
 
+    data = sheet.get_all_records()
+
+    for i, r in enumerate(data, start=2):
+        if str(r["品名"]) == name:
+            col = get_col("數量")
+            old = int(sheet.cell(i, col).value)
+            new = old + qty
+            sheet.update_cell(i, col, new)
+
+            reply_text(token, f"已合併庫存 {old} → {new}")
+            clear_user_session(user_id)
+            return
+
+    # 沒找到 → 新增
     headers = sheet.row_values(1)
     new_row = [""] * len(headers)
 
-    new_row[get_col("品名") - 1] = item["品名"]
-    new_row[get_col("尺寸") - 1] = item["尺寸"]
-    new_row[get_col("數量") - 1] = item["數量"]
-    new_row[get_col("位置") - 1] = item["位置"]
+    new_row[get_col("品名") - 1] = name
+    new_row[get_col("數量") - 1] = qty
+    new_row[get_col("位置") - 1] = loc
 
     sheet.append_row(new_row)
 
-    reply_text(token, "✅ 手動入庫完成")
+    reply_text(token, "✅ 新增成功")
     clear_user_session(user_id)
 
 
