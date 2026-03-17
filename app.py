@@ -103,6 +103,12 @@ def handle_message(event):
         reply_text(event.reply_token, "請輸入關鍵字")
         return
 
+    if user_text == "手動入庫":
+        user_state[user_id] = "manual_name"
+        user_data[user_id] = {}
+        reply_text(event.reply_token, "請輸入品名")
+        return
+
     # ===== 查詢 =====
     if user_state.get(user_id) == "search":
         search_stock(event.reply_token, user_text)
@@ -127,7 +133,34 @@ def handle_message(event):
         process_out_qty(event.reply_token, user_id, user_text)
         return
 
-    # ❌ 其它全部不回應（重點）
+    # ===== 手動入庫 =====
+    if user_state.get(user_id) == "manual_name":
+        user_data[user_id]["品名"] = user_text
+        user_state[user_id] = "manual_size"
+        reply_text(event.reply_token, "請輸入尺寸")
+        return
+
+    if user_state.get(user_id) == "manual_size":
+        user_data[user_id]["尺寸"] = user_text
+        user_state[user_id] = "manual_qty"
+        reply_text(event.reply_token, "請輸入數量")
+        return
+
+    if user_state.get(user_id) == "manual_qty":
+        if not user_text.isdigit():
+            reply_text(event.reply_token, "請輸入數字")
+            return
+        user_data[user_id]["數量"] = int(user_text)
+        user_state[user_id] = "manual_loc"
+        reply_text(event.reply_token, "請輸入位置")
+        return
+
+    if user_state.get(user_id) == "manual_loc":
+        user_data[user_id]["位置"] = user_text
+        save_manual_stock(event.reply_token, user_id)
+        return
+
+    # ❌ 其它全部不回應
     return
 
 
@@ -144,7 +177,7 @@ def send_menu(token):
                     MessageTemplateAction(label="查詢庫存", text="查詢庫存"),
                     MessageTemplateAction(label="入庫", text="入庫"),
                     MessageTemplateAction(label="出庫", text="出庫"),
-                    MessageTemplateAction(label="全部庫存", text="全部庫存")
+                    MessageTemplateAction(label="手動入庫", text="手動入庫")
                 ]
             )
         )
@@ -185,7 +218,7 @@ def search_stock_for_in(token, user_id, keyword):
             reply_text(token, f"{r['品名']} 目前:{r['數量']}，輸入入庫數量")
             return
 
-    reply_text(token, "找不到資料")
+    reply_text(token, "找不到資料，可使用『手動入庫』")
 
 
 def process_in_qty(token, user_id, qty):
@@ -237,6 +270,23 @@ def process_out_qty(token, user_id, qty):
     sheet.update_cell(row, col, new)
 
     reply_text(token, f"出庫完成 {old} → {new}")
+    clear_user_session(user_id)
+
+
+def save_manual_stock(token, user_id):
+    item = user_data[user_id]
+
+    headers = sheet.row_values(1)
+    new_row = [""] * len(headers)
+
+    new_row[get_col("品名") - 1] = item["品名"]
+    new_row[get_col("尺寸") - 1] = item["尺寸"]
+    new_row[get_col("數量") - 1] = item["數量"]
+    new_row[get_col("位置") - 1] = item["位置"]
+
+    sheet.append_row(new_row)
+
+    reply_text(token, "✅ 手動入庫完成")
     clear_user_session(user_id)
 
 
