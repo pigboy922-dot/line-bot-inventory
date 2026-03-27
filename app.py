@@ -1,5 +1,6 @@
 import os
 import json
+from datetime import datetime
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.models import (
@@ -38,7 +39,9 @@ scope = [
 creds_info = json.loads(GOOGLE_CREDENTIALS_JSON)
 credentials = Credentials.from_service_account_info(creds_info, scopes=scope)
 gc = gspread.authorize(credentials)
-sheet = gc.open_by_key(GOOGLE_SHEET_ID).sheet1
+
+spreadsheet = gc.open_by_key(GOOGLE_SHEET_ID)
+sheet = spreadsheet.sheet1
 
 # 使用者狀態
 user_state = {}
@@ -48,6 +51,32 @@ user_data = {}
 
 # 全部庫存每頁筆數
 PAGE_SIZE = 10
+
+
+def ensure_log_worksheet(title, headers):
+    """
+    只做安全建立：
+    - 分頁不存在 -> 建立 + 寫入表頭
+    - 分頁已存在 -> 不刪資料，只在第一列空白時補表頭
+    """
+    try:
+        ws = spreadsheet.worksheet(title)
+        first_row = ws.row_values(1)
+
+        if not first_row:
+            ws.update("A1:N1", [headers])
+
+        return ws
+    except Exception:
+        ws = spreadsheet.add_worksheet(title=title, rows=2000, cols=max(len(headers), 14))
+        ws.update("A1:N1", [headers])
+        return ws
+
+
+log_sheet = ensure_log_worksheet(
+    "出入庫紀錄",
+    ["時間", "聊天室類型", "群組名稱", "群組ID", "room_id", "user_key", "動作", "品名", "尺寸", "原數量", "異動數量", "新數量", "位置", "備註"]
+)
 
 
 @app.route("/", methods=["GET"])
@@ -93,6 +122,77 @@ def get_user_key(event):
     return "unknown_user"
 
 
+def get_source_info(event):
+    source = event.source
+
+    group_id = getattr(source, "group_id", "")
+    room_id = getattr(source, "room_id", "")
+    user_id = getattr(source, "user_id", "")
+
+    info = {
+        "source_type": "user",
+        "group_name": "",
+        "group_id": "",
+        "room_id": "",
+        "user_id": user_id
+    }
+
+    if group_id:
+        info["source_type"] = "group"
+        info["group_id"] = group_id
+
+        try:
+            group_summary = line_bot_api.get_group_summary(group_id)
+            info["group_name"] = str(getattr(group_summary, "group_name", "")).strip()
+        except Exception as e:
+            print("get_group_summary error:", e)
+            info["group_name"] = ""
+
+        return info
+
+    if room_id:
+        info["source_type"] = "room"
+        info["group_id"] = room_id
+        info["room_id"] = room_id
+        return info
+
+    return info
+
+
+def log_inventory_action(event, user_id, action, item=None, old_qty="", change_qty="", new_qty="", note=""):
+    try:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        source_info = get_source_info(event)
+
+        name = ""
+        size = ""
+        loc = ""
+
+        if item:
+            name = str(item.get("品名", "")).strip()
+            size = str(item.get("尺寸", "")).strip()
+            loc = str(item.get("位置", "")).strip()
+
+        log_sheet.append_row([
+            now,
+            source_info["source_type"],
+            source_info["group_name"],
+            source_info["group_id"],
+            source_info["room_id"],
+            user_id,
+            action,
+            name,
+            size,
+            old_qty,
+            change_qty,
+            new_qty,
+            loc,
+            note
+        ])
+    except Exception as e:
+        print("log_inventory_action error:", e)
+
+
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     user_text = str(event.message.text).strip()
@@ -104,7 +204,6 @@ def handle_message(event):
 
     current_state = user_state.get(user_id)
 
-    # 安靜版核心：若目前沒有流程狀態，且不是啟動指令，就不回應
     allowed_idle_commands = {
         "塊材查詢",
         "取消",
@@ -125,12 +224,10 @@ def handle_message(event):
     ):
         return
 
-    # 取消
     if user_text == "取消":
         clear_user_session(user_id)
         return
 
-    # 直接出庫格式：直接出庫::列號
     if user_text.startswith("直接出庫::"):
         try:
             row_number = int(user_text.split("::")[1])
@@ -140,7 +237,6 @@ def handle_message(event):
             reply_text(event.reply_token, "出庫資料錯誤，請重新查詢")
         return
 
-    # 直接入庫格式：直接入庫::列號
     if user_text.startswith("直接入庫::"):
         try:
             row_number = int(user_text.split("::")[1])
@@ -150,7 +246,6 @@ def handle_message(event):
             reply_text(event.reply_token, "入庫資料錯誤，請重新查詢")
         return
 
-    # 全部庫存分頁格式：全部庫存::頁碼
     if user_text.startswith("全部庫存::"):
         try:
             page = int(user_text.split("::")[1])
@@ -161,7 +256,6 @@ def handle_message(event):
             reply_text(event.reply_token, "頁碼錯誤，請重新操作")
         return
 
-    # 主選單
     if user_text == "塊材查詢":
         clear_user_session(user_id)
         send_menu(event.reply_token)
@@ -199,20 +293,17 @@ def handle_message(event):
         reply_text(event.reply_token, "請輸入品名")
         return
 
-    # 查詢流程
     if user_state.get(user_id) == "waiting_search_keyword":
         search_stock(event.reply_token, user_id, user_text)
         return
 
-    # 入庫流程
     if user_state.get(user_id) == "waiting_in_keyword":
         search_stock_for_in(event.reply_token, user_id, user_text)
         return
     elif user_state.get(user_id) == "waiting_in_qty":
-        process_in_qty(event.reply_token, user_id, user_text)
+        process_in_qty(event, event.reply_token, user_id, user_text)
         return
 
-    # 出庫流程
     if user_state.get(user_id) == "waiting_out_keyword":
         search_stock_for_out(event.reply_token, user_id, user_text)
         return
@@ -220,10 +311,9 @@ def handle_message(event):
         process_out_select(event.reply_token, user_id, user_text)
         return
     elif user_state.get(user_id) == "waiting_out_qty":
-        process_out_qty(event.reply_token, user_id, user_text)
+        process_out_qty(event, event.reply_token, user_id, user_text)
         return
 
-    # 手動入庫流程
     if user_state.get(user_id) == "manual_in_name":
         user_data[user_id]["品名"] = user_text
         user_state[user_id] = "manual_in_size"
@@ -248,7 +338,7 @@ def handle_message(event):
         return
     elif user_state.get(user_id) == "manual_in_loc":
         user_data[user_id]["位置"] = user_text
-        save_manual_stock(event.reply_token, user_id)
+        save_manual_stock(event, event.reply_token, user_id)
         return
 
     return
@@ -557,7 +647,7 @@ def search_stock_for_in(reply_token, user_id, keyword):
         reply_text(reply_token, f"入庫查詢失敗：{str(e)}")
 
 
-def process_in_qty(reply_token, user_id, user_text):
+def process_in_qty(event, reply_token, user_id, user_text):
     try:
         if not is_valid_int(user_text):
             reply_text(reply_token, "入庫數量請輸入整數")
@@ -580,6 +670,17 @@ def process_in_qty(reply_token, user_id, user_text):
         new_qty = old_qty + add_qty
 
         sheet.update_cell(row_num, qty_col, new_qty)
+
+        log_inventory_action(
+            event,
+            user_id,
+            "入庫",
+            item=selected_item,
+            old_qty=old_qty,
+            change_qty=add_qty,
+            new_qty=new_qty,
+            note="直接入庫"
+        )
 
         reply_text(
             reply_token,
@@ -658,7 +759,7 @@ def process_out_select(reply_token, user_id, user_text):
         reply_text(reply_token, f"出庫選擇失敗：{str(e)}")
 
 
-def process_out_qty(reply_token, user_id, user_text):
+def process_out_qty(event, reply_token, user_id, user_text):
     try:
         if not is_valid_int(user_text):
             reply_text(reply_token, "出庫數量請輸入整數")
@@ -686,6 +787,17 @@ def process_out_qty(reply_token, user_id, user_text):
         new_qty = old_qty - out_qty
         sheet.update_cell(row_num, qty_col, new_qty)
 
+        log_inventory_action(
+            event,
+            user_id,
+            "出庫",
+            item=selected_item,
+            old_qty=old_qty,
+            change_qty=out_qty,
+            new_qty=new_qty,
+            note="直接出庫"
+        )
+
         reply_text(
             reply_token,
             f"出庫完成：\n"
@@ -704,7 +816,7 @@ def process_out_qty(reply_token, user_id, user_text):
         reply_text(reply_token, f"出庫更新失敗：{str(e)}")
 
 
-def save_manual_stock(reply_token, user_id):
+def save_manual_stock(event, reply_token, user_id):
     try:
         item = user_data.get(user_id, {})
         name = str(item.get("品名", "")).strip()
@@ -726,6 +838,21 @@ def save_manual_stock(reply_token, user_id):
         new_row[col_loc - 1] = loc
 
         sheet.append_row(new_row)
+
+        log_inventory_action(
+            event,
+            user_id,
+            "手動入庫",
+            item={
+                "品名": name,
+                "尺寸": size,
+                "位置": loc
+            },
+            old_qty=0,
+            change_qty=qty,
+            new_qty=qty,
+            note="新增品項"
+        )
 
         reply_text(
             reply_token,
@@ -780,7 +907,7 @@ def to_int(value):
         if value is None or value == "":
             return 0
         return int(float(str(value).strip()))
-    except:
+    except Exception:
         return 0
 
 
@@ -788,7 +915,7 @@ def is_valid_int(text):
     try:
         int(text)
         return True
-    except:
+    except Exception:
         return False
 
 
