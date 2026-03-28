@@ -1,7 +1,5 @@
-flask
-line-bot-sdk
-gspread
-oauth2client
-pandas
-gunicorn
-python-dotenv
+Flask==3.0.3
+flask-cors==4.0.1
+gspread==6.1.2
+google-auth==2.35.0
+gunicorn==23.0.0

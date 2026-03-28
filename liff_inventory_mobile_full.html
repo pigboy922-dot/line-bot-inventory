@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>塊材管理 LIFF</title>
+  <script src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
+  <style>
+    :root {
+      --bg: #f5f7fb; --card: #ffffff; --text: #1f2937; --muted: #6b7280; --line: #e5e7eb;
+      --primary: #06c755; --primary-dark: #05a847; --danger: #dc2626; --warning: #f59e0b;
+      --shadow: 0 8px 24px rgba(15, 23, 42, 0.08); --radius: 18px;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font-family: "Noto Sans TC", "PingFang TC", "Microsoft JhengHei", sans-serif; min-height: 100%; }
+    body { display: flex; justify-content: center; padding: 12px; }
+    .app { width: 100%; max-width: 720px; min-height: calc(100vh - 24px); display: flex; flex-direction: column; gap: 12px; }
+    .header { background: linear-gradient(135deg, #06c755 0%, #11b862 100%); color: white; padding: 18px 16px; border-radius: 22px; box-shadow: var(--shadow); }
+    .header-top { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .title { font-size: 22px; font-weight: 800; letter-spacing: .5px; }
+    .sub { margin-top: 8px; font-size: 13px; opacity: .95; line-height: 1.5; }
+    .user-chip { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-radius: 999px; background: rgba(255,255,255,.18); backdrop-filter: blur(6px); font-size: 12px; white-space: nowrap; }
+    .user-chip img { width: 28px; height: 28px; border-radius: 50%; object-fit: cover; background: rgba(255,255,255,.35); }
+    .card { background: var(--card); border-radius: var(--radius); box-shadow: var(--shadow); padding: 14px; }
+    .toolbar { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+    .btn { appearance: none; border: none; outline: none; padding: 14px 12px; border-radius: 16px; font-size: 15px; font-weight: 700; cursor: pointer; transition: transform .12s ease, opacity .12s ease, background .12s ease; }
+    .btn:active { transform: scale(.985); }
+    .btn-primary { background: var(--primary); color: #fff; }
+    .btn-primary:hover { background: var(--primary-dark); }
+    .btn-secondary { background: #eef2f7; color: var(--text); }
+    .btn-danger { background: #fee2e2; color: #991b1b; }
+    .btn-warning { background: #fef3c7; color: #92400e; }
+    .section-title { display: flex; align-items: center; justify-content: space-between; gap: 10px; font-size: 17px; font-weight: 800; margin-bottom: 12px; }
+    .muted { color: var(--muted); font-size: 13px; }
+    .view { display: none; } .view.active { display: block; }
+    .field { margin-bottom: 12px; }
+    .label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px; font-weight: 700; }
+    .input { width: 100%; border: 1px solid var(--line); background: #fff; border-radius: 14px; padding: 13px 14px; font-size: 15px; color: var(--text); outline: none; }
+    .input:focus { border-color: var(--primary); box-shadow: 0 0 0 3px rgba(6, 199, 85, .12); }
+    .grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+    .result-list { display: flex; flex-direction: column; gap: 10px; }
+    .item { border: 1px solid var(--line); border-radius: 16px; padding: 12px; background: #fff; }
+    .item-head { display: flex; justify-content: space-between; align-items: start; gap: 8px; margin-bottom: 8px; }
+    .item-title { font-weight: 800; font-size: 16px; line-height: 1.4; }
+    .badge { display: inline-flex; align-items: center; justify-content: center; min-width: 56px; padding: 6px 10px; border-radius: 999px; background: #ecfdf5; color: #047857; font-size: 12px; font-weight: 800; }
+    .meta { display: grid; gap: 4px; font-size: 14px; color: #374151; margin-bottom: 10px; }
+    .item-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+    .stack { display: flex; flex-direction: column; gap: 10px; }
+    .pager { display: flex; gap: 10px; align-items: center; justify-content: space-between; margin-top: 12px; }
+    .pager-center { font-weight: 800; font-size: 14px; }
+    .toast-wrap { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); width: min(90vw, 540px); z-index: 80; pointer-events: none; }
+    .toast { background: rgba(17, 24, 39, .94); color: white; border-radius: 14px; padding: 13px 15px; font-size: 14px; box-shadow: var(--shadow); opacity: 0; transform: translateY(8px); transition: .22s ease; }
+    .toast.show { opacity: 1; transform: translateY(0); }
+    .loading { position: fixed; inset: 0; background: rgba(255,255,255,.68); backdrop-filter: blur(2px); display: none; align-items: center; justify-content: center; z-index: 90; }
+    .loading.show { display: flex; }
+    .spinner { width: 56px; height: 56px; border-radius: 50%; border: 4px solid rgba(6,199,85,.18); border-top-color: var(--primary); animation: spin .8s linear infinite; background: white; box-shadow: var(--shadow); }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    @media (max-width: 460px) { .toolbar, .grid-2, .item-actions { grid-template-columns: 1fr; } .header-top { flex-direction: column; align-items: flex-start; } .user-chip { width: 100%; justify-content: flex-start; } }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <div class="header">
+      <div class="header-top">
+        <div>
+          <div class="title">塊材管理 LIFF</div>
+          <div class="sub">手機版庫存查詢、入庫、出庫、手動入庫、全部庫存，一頁操作。</div>
+        </div>
+        <div class="user-chip" id="userChip">
+          <img id="userAvatar" alt="avatar" />
+          <div id="userName">未登入</div>
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="toolbar">
+        <button class="btn btn-primary" data-view="homeView">首頁</button>
+        <button class="btn btn-secondary" data-view="searchView">查詢庫存</button>
+        <button class="btn btn-secondary" data-view="stockView">全部庫存</button>
+        <button class="btn btn-secondary" data-view="manualView">手動入庫</button>
+      </div>
+    </div>
+    <div class="card view active" id="homeView">
+      <div class="section-title">快速操作 <span class="muted">保留原本功能邏輯</span></div>
+      <div class="toolbar">
+        <button class="btn btn-primary" id="quickSearchBtn">查詢庫存</button>
+        <button class="btn btn-primary" id="quickAllBtn">全部庫存</button>
+        <button class="btn btn-warning" id="quickManualBtn">手動入庫</button>
+        <button class="btn btn-secondary" id="quickReloadBtn">重新整理</button>
+      </div>
+      <div style="height:12px"></div>
+      <div class="stack muted">
+        <div>1. Google Sheet 與出入庫紀錄由後端處理。</div>
+        <div>2. 每筆入庫／出庫可帶入 LINE 使用者資訊。</div>
+        <div>3. 先部署 API，再把 API_BASE 換成你的 Render 網址。</div>
+      </div>
+    </div>
+    <div class="card view" id="searchView">
+      <div class="section-title">查詢 / 入庫 / 出庫 <span class="muted">可輸入品名或尺寸</span></div>
+      <div class="field"><label class="label" for="searchKeyword">關鍵字</label><input class="input" id="searchKeyword" placeholder="例如 KF-0030N、509、BDP-1" /></div>
+      <div class="grid-2"><button class="btn btn-primary" id="searchBtn">查詢</button><button class="btn btn-secondary" id="clearSearchBtn">清空</button></div>
+      <div style="height:12px"></div><div id="searchResult" class="result-list"></div>
+    </div>
+    <div class="card view" id="stockView">
+      <div class="section-title">全部庫存 <span class="muted" id="stockSummary">載入中</span></div>
+      <div id="stockResult" class="result-list"></div>
+      <div class="pager"><button class="btn btn-secondary" id="prevPageBtn">上一頁</button><div class="pager-center" id="pageInfo">第 1 / 1 頁</div><button class="btn btn-secondary" id="nextPageBtn">下一頁</button></div>
+    </div>
+    <div class="card view" id="manualView">
+      <div class="section-title">手動入庫 <span class="muted">新增品項</span></div>
+      <div class="field"><label class="label" for="manualName">品名</label><input class="input" id="manualName" /></div>
+      <div class="field"><label class="label" for="manualSize">尺寸</label><input class="input" id="manualSize" /></div>
+      <div class="grid-2">
+        <div class="field"><label class="label" for="manualQty">數量</label><input class="input" id="manualQty" inputmode="numeric" /></div>
+        <div class="field"><label class="label" for="manualLoc">位置</label><input class="input" id="manualLoc" /></div>
+      </div>
+      <div class="grid-2"><button class="btn btn-warning" id="manualSubmitBtn">送出手動入庫</button><button class="btn btn-secondary" id="manualClearBtn">清空</button></div>
+    </div>
+  </div>
+  <div class="toast-wrap"><div class="toast" id="toast"></div></div>
+  <div class="loading" id="loading"><div class="spinner"></div></div>
+  <script>
+    const CONFIG = {
+      LIFF_ID: '2009630662-Qeb3Wh1t',
+      API_BASE: 'https://YOUR-RENDER-SERVICE.onrender.com',
+      PAGE_SIZE: 10
+    };
+
+    const state = { profile: null, currentPage: 1, totalPages: 1, totalCount: 0, lastSearchKeyword: '', stockRows: [], searchRows: [] };
+    const el = {
+      views: [...document.querySelectorAll('.view')], userName: document.getElementById('userName'), userAvatar: document.getElementById('userAvatar'),
+      loading: document.getElementById('loading'), toast: document.getElementById('toast'), searchKeyword: document.getElementById('searchKeyword'),
+      searchResult: document.getElementById('searchResult'), stockResult: document.getElementById('stockResult'), stockSummary: document.getElementById('stockSummary'),
+      pageInfo: document.getElementById('pageInfo'), manualName: document.getElementById('manualName'), manualSize: document.getElementById('manualSize'),
+      manualQty: document.getElementById('manualQty'), manualLoc: document.getElementById('manualLoc')
+    };
+
+    function showLoading(show) { el.loading.classList.toggle('show', !!show); }
+    let toastTimer = null;
+    function showToast(message) { clearTimeout(toastTimer); el.toast.textContent = message; el.toast.classList.add('show'); toastTimer = setTimeout(() => el.toast.classList.remove('show'), 1800); }
+    function switchView(viewId) { el.views.forEach(v => v.classList.toggle('active', v.id === viewId)); }
+    function escapeHtml(value) { return String(value).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'",'&#39;'); }
+    function assertPositiveInt(value, label) { const n = Number(value); if (!Number.isInteger(n) || n <= 0) throw new Error(`${label}必須大於 0`); return n; }
+
+    async function api(path, options = {}) {
+      const headers = { 'Content-Type': 'application/json', ...(options.headers || {}) };
+      const idToken = (window.liff && liff.isLoggedIn()) ? liff.getIDToken() : '';
+      if (idToken) headers['X-LIFF-ID-Token'] = idToken;
+      const res = await fetch(`${CONFIG.API_BASE}${path}`, { ...options, headers });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.message || '伺服器錯誤');
+      return data;
+    }
+
+    async function initLiff() {
+      await liff.init({ liffId: CONFIG.LIFF_ID });
+      if (!liff.isLoggedIn()) { liff.login(); return; }
+      const profile = await liff.getProfile();
+      state.profile = profile;
+      el.userName.textContent = profile.displayName || 'LINE 使用者';
+      el.userAvatar.src = profile.pictureUrl || 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI2NCIgaGVpZ2h0PSI2NCI+PHJlY3Qgd2lkdGg9IjY0IiBoZWlnaHQ9IjY0IiByeD0iMzIiIGZpbGw9IiNlNWU3ZWIiLz48dGV4dCB4PSIzMiIgeT0iMzciIHRleHQtYW5jaG9yPSJtaWRkbGUiIGZvbnQtc2l6ZT0iMjYiIGZpbGw9IiM5Y2EzYWYiPuS6ujwvdGV4dD48L3N2Zz4=';
+    }
+
+    function bindViewButtons() {
+      document.querySelectorAll('[data-view]').forEach(btn => btn.addEventListener('click', () => switchView(btn.dataset.view)));
+      document.getElementById('quickSearchBtn').addEventListener('click', () => switchView('searchView'));
+      document.getElementById('quickAllBtn').addEventListener('click', async () => { switchView('stockView'); await loadStockPage(1); });
+      document.getElementById('quickManualBtn').addEventListener('click', () => switchView('manualView'));
+      document.getElementById('quickReloadBtn').addEventListener('click', bootstrap);
+    }
+
+    function renderSearchResults(rows) {
+      if (!rows.length) { el.searchResult.innerHTML = '<div class="muted">找不到相關資料</div>'; return; }
+      const frag = document.createDocumentFragment();
+      rows.forEach(item => {
+        const card = document.createElement('div');
+        card.className = 'item';
+        card.innerHTML = `<div class="item-head"><div class="item-title">${escapeHtml(item.品名 || '')}</div><div class="badge">庫存 ${escapeHtml(String(item.數量 ?? 0))}</div></div><div class="meta"><div>尺寸：${escapeHtml(item.尺寸 || '')}</div><div>位置：${escapeHtml(item.位置 || '')}</div><div>列號：${escapeHtml(String(item.row_number || ''))}</div></div><div class="item-actions"><button class="btn btn-primary action-in">入庫</button><button class="btn btn-danger action-out">出庫</button></div>`;
+        card.querySelector('.action-in').addEventListener('click', async () => { const qty = prompt(`請輸入 ${item.品名} 要入庫的數量`, '1'); if (qty === null) return; await submitInOut('in', item, qty); });
+        card.querySelector('.action-out').addEventListener('click', async () => { const qty = prompt(`請輸入 ${item.品名} 要出庫的數量`, '1'); if (qty === null) return; await submitInOut('out', item, qty); });
+        frag.appendChild(card);
+      });
+      el.searchResult.replaceChildren(frag);
+    }
+
+    function renderStockResults(rows) {
+      if (!rows.length) { el.stockResult.innerHTML = '<div class="muted">目前沒有資料</div>'; return; }
+      const frag = document.createDocumentFragment();
+      rows.forEach(item => {
+        const card = document.createElement('div');
+        card.className = 'item';
+        card.innerHTML = `<div class="item-head"><div class="item-title">${escapeHtml(item.品名 || '')}</div><div class="badge">${escapeHtml(String(item.數量 ?? 0))}</div></div><div class="meta"><div>尺寸：${escapeHtml(item.尺寸 || '')}</div><div>位置：${escapeHtml(item.位置 || '')}</div><div>列號：${escapeHtml(String(item.row_number || ''))}</div></div><div class="item-actions"><button class="btn btn-primary action-in">入庫</button><button class="btn btn-danger action-out">出庫</button></div>`;
+        card.querySelector('.action-in').addEventListener('click', async () => { const qty = prompt(`請輸入 ${item.品名} 要入庫的數量`, '1'); if (qty === null) return; await submitInOut('in', item, qty); });
+        card.querySelector('.action-out').addEventListener('click', async () => { const qty = prompt(`請輸入 ${item.品名} 要出庫的數量`, '1'); if (qty === null) return; await submitInOut('out', item, qty); });
+        frag.appendChild(card);
+      });
+      el.stockResult.replaceChildren(frag);
+    }
+
+    function updatePager() {
+      el.pageInfo.textContent = `第 ${state.currentPage} / ${state.totalPages} 頁`;
+      el.stockSummary.textContent = `共 ${state.totalCount} 筆`;
+      document.getElementById('prevPageBtn').disabled = state.currentPage <= 1;
+      document.getElementById('nextPageBtn').disabled = state.currentPage >= state.totalPages;
+    }
+
+    async function searchStock() {
+      const keyword = el.searchKeyword.value.trim();
+      if (!keyword) return showToast('請輸入關鍵字');
+      showLoading(true);
+      try {
+        const data = await api(`/api/search?q=${encodeURIComponent(keyword)}`);
+        state.lastSearchKeyword = keyword;
+        state.searchRows = Array.isArray(data.items) ? data.items : [];
+        renderSearchResults(state.searchRows);
+      } catch (err) { showToast(err.message || '查詢失敗'); }
+      finally { showLoading(false); }
+    }
+
+    async function loadStockPage(page) {
+      showLoading(true);
+      try {
+        const data = await api(`/api/stock?page=${page}&page_size=${CONFIG.PAGE_SIZE}`);
+        state.currentPage = Number(data.page || 1);
+        state.totalPages = Math.max(1, Number(data.total_pages || 1));
+        state.totalCount = Number(data.total_count || 0);
+        state.stockRows = Array.isArray(data.items) ? data.items : [];
+        renderStockResults(state.stockRows);
+        updatePager();
+      } catch (err) { showToast(err.message || '讀取失敗'); }
+      finally { showLoading(false); }
+    }
+
+    async function submitInOut(type, item, qty) {
+      showLoading(true);
+      try {
+        const amount = assertPositiveInt(qty, type === 'in' ? '入庫數量' : '出庫數量');
+        const payload = { row_number: item.row_number, qty: amount, line_user_id: state.profile?.userId || '', line_name: state.profile?.displayName || '' };
+        const data = await api(type === 'in' ? '/api/in' : '/api/out', { method: 'POST', body: JSON.stringify(payload) });
+        showToast(data.message || (type === 'in' ? '入庫完成' : '出庫完成'));
+        if (state.lastSearchKeyword) await searchStock();
+        if (document.getElementById('stockView').classList.contains('active')) await loadStockPage(state.currentPage);
+      } catch (err) { showToast(err.message || '送出失敗'); }
+      finally { showLoading(false); }
+    }
+
+    async function submitManualIn() {
+      showLoading(true);
+      try {
+        const payload = {
+          name: el.manualName.value.trim(), size: el.manualSize.value.trim(), qty: assertPositiveInt(el.manualQty.value.trim(), '數量'), location: el.manualLoc.value.trim(),
+          line_user_id: state.profile?.userId || '', line_name: state.profile?.displayName || ''
+        };
+        if (!payload.name) throw new Error('請輸入品名');
+        if (!payload.size) throw new Error('請輸入尺寸');
+        if (!payload.location) throw new Error('請輸入位置');
+        const data = await api('/api/manual-in', { method: 'POST', body: JSON.stringify(payload) });
+        el.manualName.value = ''; el.manualSize.value = ''; el.manualQty.value = ''; el.manualLoc.value = '';
+        showToast(data.message || '手動入庫完成'); switchView('stockView'); await loadStockPage(1);
+      } catch (err) { showToast(err.message || '手動入庫失敗'); }
+      finally { showLoading(false); }
+    }
+
+    function bindActions() {
+      document.getElementById('searchBtn').addEventListener('click', searchStock);
+      document.getElementById('clearSearchBtn').addEventListener('click', () => { el.searchKeyword.value = ''; state.lastSearchKeyword = ''; state.searchRows = []; el.searchResult.innerHTML = ''; });
+      el.searchKeyword.addEventListener('keydown', e => { if (e.key === 'Enter') searchStock(); });
+      document.getElementById('prevPageBtn').addEventListener('click', () => { if (state.currentPage > 1) loadStockPage(state.currentPage - 1); });
+      document.getElementById('nextPageBtn').addEventListener('click', () => { if (state.currentPage < state.totalPages) loadStockPage(state.currentPage + 1); });
+      document.getElementById('manualSubmitBtn').addEventListener('click', submitManualIn);
+      document.getElementById('manualClearBtn').addEventListener('click', () => { el.manualName.value = ''; el.manualSize.value = ''; el.manualQty.value = ''; el.manualLoc.value = ''; });
+    }
+
+    async function bootstrap() {
+      showLoading(true);
+      try { await initLiff(); await loadStockPage(1); }
+      catch (err) { console.error(err); showToast(err.message || '初始化失敗'); }
+      finally { showLoading(false); }
+    }
+
+    bindViewButtons(); bindActions(); bootstrap();
+  </script>
+</body>
+</html>
