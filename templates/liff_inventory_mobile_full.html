@@ -19,7 +19,6 @@
       --shadow: 0 8px 24px rgba(15, 23, 42, 0.08);
       --radius: 18px;
     }
-
     * { box-sizing: border-box; }
     html, body {
       margin: 0;
@@ -29,13 +28,11 @@
       font-family: "Noto Sans TC", "PingFang TC", "Microsoft JhengHei", sans-serif;
       min-height: 100%;
     }
-
     body {
       display: flex;
       justify-content: center;
       padding: 12px;
     }
-
     .app {
       width: 100%;
       max-width: 720px;
@@ -44,7 +41,6 @@
       flex-direction: column;
       gap: 12px;
     }
-
     .header {
       background: linear-gradient(135deg, #06c755 0%, #11b862 100%);
       color: white;
@@ -52,27 +48,23 @@
       border-radius: 22px;
       box-shadow: var(--shadow);
     }
-
     .header-top {
       display: flex;
       align-items: center;
       justify-content: space-between;
       gap: 12px;
     }
-
     .title {
       font-size: 22px;
       font-weight: 800;
       letter-spacing: .5px;
     }
-
     .sub {
       margin-top: 8px;
       font-size: 13px;
       opacity: .95;
       line-height: 1.5;
     }
-
     .user-chip {
       display: flex;
       align-items: center;
@@ -84,7 +76,6 @@
       font-size: 12px;
       white-space: nowrap;
     }
-
     .user-chip img {
       width: 28px;
       height: 28px;
@@ -92,20 +83,17 @@
       object-fit: cover;
       background: rgba(255,255,255,.35);
     }
-
     .card {
       background: var(--card);
       border-radius: var(--radius);
       box-shadow: var(--shadow);
       padding: 14px;
     }
-
     .toolbar {
       display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
+      grid-template-columns: repeat(3, minmax(0, 1fr));
       gap: 10px;
     }
-
     .btn {
       appearance: none;
       border: none;
@@ -117,27 +105,12 @@
       cursor: pointer;
       transition: transform .12s ease, opacity .12s ease, background .12s ease;
     }
-
     .btn:active { transform: scale(.985); }
-    .btn-primary {
-      background: var(--primary);
-      color: #fff;
-    }
+    .btn-primary { background: var(--primary); color: #fff; }
     .btn-primary:hover { background: var(--primary-dark); }
-    .btn-secondary {
-      background: #eef2f7;
-      color: var(--text);
-    }
-    .btn-danger {
-      background: #fee2e2;
-      color: #991b1b;
-    }
-    .btn-warning {
-      background: #fef3c7;
-      color: #92400e;
-    }
-    .btn-block { width: 100%; }
-
+    .btn-secondary { background: #eef2f7; color: var(--text); }
+    .btn-danger { background: #fee2e2; color: #991b1b; }
+    .btn-warning { background: #fef3c7; color: #92400e; }
     .section-title {
       display: flex;
       align-items: center;
@@ -147,12 +120,9 @@
       font-weight: 800;
       margin-bottom: 12px;
     }
-
     .muted { color: var(--muted); font-size: 13px; }
-
     .view { display: none; }
     .view.active { display: block; }
-
     .field { margin-bottom: 12px; }
     .label {
       display: block;
@@ -161,8 +131,7 @@
       margin-bottom: 6px;
       font-weight: 700;
     }
-
-    .input, .select, .textarea {
+    .input {
       width: 100%;
       border: 1px solid var(--line);
       background: #fff;
@@ -172,34 +141,26 @@
       color: var(--text);
       outline: none;
     }
-    .textarea {
-      min-height: 96px;
-      resize: vertical;
-    }
-    .input:focus, .select:focus, .textarea:focus {
+    .input:focus {
       border-color: var(--primary);
       box-shadow: 0 0 0 3px rgba(6, 199, 85, .12);
     }
-
     .grid-2 {
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 10px;
     }
-
     .result-list {
       display: flex;
       flex-direction: column;
       gap: 10px;
     }
-
     .item {
       border: 1px solid var(--line);
       border-radius: 16px;
       padding: 12px;
       background: #fff;
     }
-
     .item-head {
       display: flex;
       justify-content: space-between;
@@ -207,13 +168,11 @@
       gap: 8px;
       margin-bottom: 8px;
     }
-
     .item-title {
       font-weight: 800;
       font-size: 16px;
       line-height: 1.4;
     }
-
     .badge {
       display: inline-flex;
       align-items: center;
@@ -226,7 +185,6 @@
       font-size: 12px;
       font-weight: 800;
     }
-
     .meta {
       display: grid;
       gap: 4px;
@@ -234,16 +192,11 @@
       color: #374151;
       margin-bottom: 10px;
     }
-
     .item-actions {
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 8px;
     }
-
-    .stack { display: flex; flex-direction: column; gap: 10px; }
-    .hidden { display: none !important; }
-
     .pager {
       display: flex;
       gap: 10px;
@@ -251,12 +204,10 @@
       justify-content: space-between;
       margin-top: 12px;
     }
-
     .pager-center {
       font-weight: 800;
       font-size: 14px;
     }
-
     .toast-wrap {
       position: fixed;
       left: 50%;
@@ -266,7 +217,6 @@
       z-index: 80;
       pointer-events: none;
     }
-
     .toast {
       background: rgba(17, 24, 39, .94);
       color: white;
@@ -278,12 +228,10 @@
       transform: translateY(8px);
       transition: .22s ease;
     }
-
     .toast.show {
       opacity: 1;
       transform: translateY(0);
     }
-
     .loading {
       position: fixed;
       inset: 0;
@@ -294,9 +242,7 @@
       justify-content: center;
       z-index: 90;
     }
-
     .loading.show { display: flex; }
-
     .spinner {
       width: 56px;
       height: 56px;
@@ -307,11 +253,8 @@
       background: white;
       box-shadow: var(--shadow);
     }
-
     @keyframes spin { to { transform: rotate(360deg); } }
-
     .footer-space { height: env(safe-area-inset-bottom, 0px); }
-
     @media (max-width: 460px) {
       .toolbar, .grid-2, .item-actions { grid-template-columns: 1fr; }
       .header-top { flex-direction: column; align-items: flex-start; }
@@ -325,7 +268,7 @@
       <div class="header-top">
         <div>
           <div class="title">塊材管理 LIFF</div>
-          <div class="sub">手機版庫存查詢、入庫、出庫、手動入庫、全部庫存，一頁操作。</div>
+          <div class="sub">手機版庫存查詢、入庫、出庫、手動入庫，一頁操作。</div>
         </div>
         <div class="user-chip" id="userChip">
           <img id="userAvatar" alt="avatar" />
@@ -336,30 +279,13 @@
 
     <div class="card">
       <div class="toolbar">
-        <button class="btn btn-primary" data-view="homeView">首頁</button>
-        <button class="btn btn-secondary" data-view="searchView">查詢庫存</button>
+        <button class="btn btn-primary" data-view="searchView">查詢庫存</button>
         <button class="btn btn-secondary" data-view="stockView">全部庫存</button>
         <button class="btn btn-secondary" data-view="manualView">手動入庫</button>
       </div>
     </div>
 
-    <div class="card view active" id="homeView">
-      <div class="section-title">快速操作 <span class="muted">保留原本功能邏輯</span></div>
-      <div class="toolbar">
-        <button class="btn btn-primary" id="quickSearchBtn">查詢庫存</button>
-        <button class="btn btn-primary" id="quickAllBtn">全部庫存</button>
-        <button class="btn btn-warning" id="quickManualBtn">手動入庫</button>
-        <button class="btn btn-secondary" id="quickReloadBtn">重新整理</button>
-      </div>
-      <div style="height:12px"></div>
-      <div class="stack muted">
-        <div>1. LIFF 只負責手機介面。</div>
-        <div>2. Google Sheet 與出入庫紀錄仍由後端處理，避免把金鑰放在前端。</div>
-        <div>3. 每筆入庫／出庫可帶入 LINE 使用者資訊，方便追蹤誰異動。</div>
-      </div>
-    </div>
-
-    <div class="card view" id="searchView">
+    <div class="card view active" id="searchView">
       <div class="section-title">查詢 / 入庫 / 出庫 <span class="muted">可輸入品名或尺寸</span></div>
       <div class="field">
         <label class="label" for="searchKeyword">關鍵字</label>
@@ -434,6 +360,7 @@
 
     const el = {
       views: [...document.querySelectorAll('.view')],
+      toolbarBtns: [...document.querySelectorAll('[data-view]')],
       userName: document.getElementById('userName'),
       userAvatar: document.getElementById('userAvatar'),
       loading: document.getElementById('loading'),
@@ -463,19 +390,21 @@
 
     function switchView(viewId) {
       el.views.forEach(v => v.classList.toggle('active', v.id === viewId));
+      el.toolbarBtns.forEach(btn => {
+        btn.classList.toggle('btn-primary', btn.dataset.view === viewId);
+        btn.classList.toggle('btn-secondary', btn.dataset.view !== viewId);
+      });
     }
 
     function bindViewButtons() {
-      document.querySelectorAll('[data-view]').forEach(btn => {
-        btn.addEventListener('click', () => switchView(btn.dataset.view));
+      el.toolbarBtns.forEach(btn => {
+        btn.addEventListener('click', async () => {
+          switchView(btn.dataset.view);
+          if (btn.dataset.view === 'stockView') {
+            await loadStockPage(state.currentPage || 1);
+          }
+        });
       });
-      document.getElementById('quickSearchBtn').addEventListener('click', () => switchView('searchView'));
-      document.getElementById('quickAllBtn').addEventListener('click', async () => {
-        switchView('stockView');
-        await loadStockPage(1);
-      });
-      document.getElementById('quickManualBtn').addEventListener('click', () => switchView('manualView'));
-      document.getElementById('quickReloadBtn').addEventListener('click', bootstrap);
     }
 
     function renderSearchResults(rows) {
@@ -587,10 +516,6 @@
     }
 
     async function api(path, options = {}) {
-      if (!CONFIG.API_BASE || CONFIG.API_BASE === 'YOUR_API_BASE_URL') {
-        throw new Error('請先設定 API_BASE');
-      }
-
       const headers = {
         'Content-Type': 'application/json',
         ...(options.headers || {})
@@ -612,11 +537,6 @@
     }
 
     async function initLiff() {
-      if (!CONFIG.LIFF_ID || CONFIG.LIFF_ID === 'YOUR_LIFF_ID') {
-        el.userName.textContent = '請先設定 LIFF_ID';
-        return;
-      }
-
       await liff.init({ liffId: CONFIG.LIFF_ID });
       if (!liff.isLoggedIn()) {
         liff.login();
@@ -763,7 +683,7 @@
       showLoading(true);
       try {
         await initLiff();
-        await loadStockPage(1);
+        switchView('searchView');
       } catch (err) {
         console.error(err);
         showToast(err.message || '初始化失敗');
@@ -776,26 +696,5 @@
     bindActions();
     bootstrap();
   </script>
-
-  <!--
-  後端 API 建議對應（可接你目前 Flask 專案）
-
-  GET  /api/search?q=509
-  -> { items:[{row_number, 品名, 尺寸, 數量, 位置}] }
-
-  GET  /api/stock?page=1&page_size=10
-  -> { page, total_pages, total_count, items:[...] }
-
-  POST /api/in
-  body: { row_number, qty, line_user_id, line_name, item }
-
-  POST /api/out
-  body: { row_number, qty, line_user_id, line_name, item }
-
-  POST /api/manual-in
-  body: { name, size, qty, location, line_user_id, line_name }
-
-  後端收到 X-LIFF-ID-Token 後，可用 LINE Verify API 驗證登入者身份。
-  -->
 </body>
 </html>
