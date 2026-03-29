@@ -9,7 +9,7 @@ from linebot.exceptions import InvalidSignatureError
 from linebot.models import (
     MessageEvent, TextMessage, TextSendMessage,
     TemplateSendMessage, ButtonsTemplate, MessageTemplateAction,
-    CarouselTemplate, CarouselColumn
+    CarouselTemplate, CarouselColumn, URIAction
 )
 
 import gspread
@@ -267,6 +267,7 @@ def reset_user_state(user_key):
 
 
 def build_main_menu():
+    liff_url = f"https://liff.line.me/{LIFF_ID}" if LIFF_ID else "https://line-bot-inventory-5487.onrender.com/liff"
     return TemplateSendMessage(
         alt_text="塊材管理選單",
         template=ButtonsTemplate(
@@ -274,9 +275,23 @@ def build_main_menu():
             text="請選擇功能",
             actions=[
                 MessageTemplateAction(label="查詢庫存", text="查詢庫存"),
-                MessageTemplateAction(label="入庫", text="入庫"),
                 MessageTemplateAction(label="全部庫存", text="全部庫存"),
+                URIAction(label="塊材查詢", uri=liff_url),
                 MessageTemplateAction(label="手動入庫", text="手動入庫"),
+            ]
+        )
+    )
+
+
+def build_liff_open_card():
+    liff_url = f"https://liff.line.me/{LIFF_ID}" if LIFF_ID else "https://line-bot-inventory-5487.onrender.com/liff"
+    return TemplateSendMessage(
+        alt_text="打開塊材查詢",
+        template=ButtonsTemplate(
+            title="塊材查詢",
+            text="點下面按鈕開啟 LIFF 庫存系統",
+            actions=[
+                URIAction(label="打開塊材查詢", uri=liff_url)
             ]
         )
     )
@@ -422,6 +437,11 @@ def handle_message(event):
     text = event.message.text.strip()
     state = user_states.get(user_key, "")
     missing = required_columns_ok()
+
+    if text == "塊材查詢":
+        reset_user_state(user_key)
+        line_bot_api.reply_message(event.reply_token, build_liff_open_card())
+        return
 
     if missing:
         line_bot_api.reply_message(
@@ -762,7 +782,7 @@ def handle_message(event):
         return
 
     allowed_idle_commands = {
-        "塊材管理", "查詢庫存", "入庫", "出庫", "手動入庫", "全部庫存", "取消", "返回選單"
+        "塊材管理", "塊材查詢", "查詢庫存", "入庫", "出庫", "手動入庫", "全部庫存", "取消", "返回選單"
     }
 
     if text not in allowed_idle_commands:
