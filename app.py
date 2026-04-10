@@ -10,7 +10,7 @@ from linebot.exceptions import InvalidSignatureError
 from linebot.models import (
     MessageEvent, TextMessage, TextSendMessage,
     TemplateSendMessage, ButtonsTemplate,
-    MessageTemplateAction, URIAction
+    URIAction
 )
 
 import gspread
@@ -34,6 +34,9 @@ LIFF_ID = os.getenv("LIFF_ID", "")
 if not GOOGLE_SHEET_ID:
     raise ValueError("缺少 GOOGLE_SHEET_ID")
 
+if not GOOGLE_CREDENTIALS_JSON:
+    raise ValueError("缺少 GOOGLE_CREDENTIALS_JSON")
+
 # =========================
 # LINE INIT
 # =========================
@@ -48,7 +51,11 @@ scope = [
     "https://www.googleapis.com/auth/drive"
 ]
 
-creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
+try:
+    creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
+except Exception as e:
+    raise ValueError(f"GOOGLE_CREDENTIALS_JSON 格式錯誤: {e}")
+
 credentials = Credentials.from_service_account_info(creds_dict, scopes=scope)
 gc = gspread.authorize(credentials)
 sheet = gc.open_by_key(GOOGLE_SHEET_ID).sheet1
@@ -59,7 +66,7 @@ sheet = gc.open_by_key(GOOGLE_SHEET_ID).sheet1
 def to_int(v):
     try:
         return int(float(v))
-    except:
+    except Exception:
         return 0
 
 
@@ -77,25 +84,41 @@ def get_col(name):
     raise Exception(f"找不到欄位 {name}")
 
 
-def find(keyword):
-    data = sheet.get_all_records()
-    keyword = keyword.lower().strip()
+def normalize_item(row_index, r):
+    return {
+        "row": row_index,
+        "品名": r.get("品名", ""),
+        "尺寸": r.get("尺寸", ""),
+        "數量": to_int(r.get("數量", 0)),
+        "位置": r.get("位置", ""),
+        "備註": r.get("備註", "")
+    }
 
+
+def get_all_items():
+    data = sheet.get_all_records()
     res = []
     for i, r in enumerate(data, start=2):
-        if keyword in str(r.get("品名", "")).lower() or keyword in str(r.get("尺寸", "")).lower():
-            res.append({
-                "row": i,
-                "品名": r.get("品名", ""),
-                "尺寸": r.get("尺寸", ""),
-                "數量": to_int(r.get("數量", 0)),
-                "位置": r.get("位置", "")
-            })
+        res.append(normalize_item(i, r))
     return res
 
 
+def find(keyword):
+    data = sheet.get_all_records()
+    keyword = str(keyword).lower().strip()
+
+    res = []
+    for i, r in enumerate(data, start=2):
+        name = str(r.get("品名", "")).lower()
+        size = str(r.get("尺寸", "")).lower()
+
+        # keyword 空字串時，回全部
+        if keyword == "" or keyword in name or keyword in size:
+            res.append(normalize_item(i, r))
+    return res
+
 # =========================
-# LIFF 卡片（你要的重點）
+# LIFF 卡片
 # =========================
 def liff_card():
     url = f"https://liff.line.me/{LIFF_ID}"
@@ -110,6 +133,15 @@ def liff_card():
         )
     )
 
+# =========================
+# ERROR HANDLER
+# =========================
+@app.errorhandler(Exception)
+def handle_error(e):
+    return jsonify({
+        "ok": False,
+        "error": str(e)
+    }), 500
 
 # =========================
 # HOME
@@ -118,9 +150,8 @@ def liff_card():
 def home():
     return jsonify({"ok": True})
 
-
 # =========================
-# PING（修正版）
+# PING
 # =========================
 @app.route("/ping")
 def ping():
@@ -133,11 +164,19 @@ def ping():
 
 @app.route("/health")
 def health():
-    return jsonify({
-        "ok": True,
-        "sheet_ok": True
-    })
-
+    try:
+        headers = get_headers()
+        return jsonify({
+            "ok": True,
+            "sheet_ok": True,
+            "headers": headers
+        })
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "sheet_ok": False,
+            "error": str(e)
+        }), 500
 
 # =========================
 # LIFF PAGE
@@ -145,7 +184,6 @@ def health():
 @app.route("/liff")
 def liff():
     return render_template("liff_inventory_mobile_full.html")
-
 
 # =========================
 # CALLBACK
@@ -162,15 +200,13 @@ def callback():
 
     return "OK"
 
-
 # =========================
-# MESSAGE HANDLER（核心修正）
+# MESSAGE HANDLER
 # =========================
 @handler.add(MessageEvent, message=TextMessage)
 def handle(event):
     text = event.message.text.strip()
 
-    # ✅ 你要的：喚醒一定進 LIFF
     if text in ["塊材查詢", "塊材管理", "庫存", "查詢"]:
         line_bot_api.reply_message(
             event.reply_token,
@@ -178,14 +214,12 @@ def handle(event):
         )
         return
 
-    # fallback
     if text == "ping":
         line_bot_api.reply_message(
             event.reply_token,
             TextSendMessage(text="pong")
         )
         return
-
 
 # =========================
 # API SEARCH
@@ -195,6 +229,88 @@ def api_search():
     q = request.args.get("q", "")
     return jsonify({"ok": True, "items": find(q)})
 
+# =========================
+# API ALL
+# =========================
+@app.route("/api/all")
+def api_all():
+    return jsonify({
+        "ok": True,
+        "items": get_all_items()
+    })
+
+# =========================
+# API IN
+# =========================
+@app.route("/api/in", methods=["POST"])
+def api_in():
+    data = request.get_json(silent=True) or {}
+
+    name = str(data.get("品名", "")).strip()
+    qty = to_int(data.get("數量", 0))
+
+    if not name:
+        return jsonify({"ok": False, "msg": "缺少品名"}), 400
+
+    if qty <= 0:
+        return jsonify({"ok": False, "msg": "數量需大於0"}), 400
+
+    items = find(name)
+    if not items:
+        return jsonify({"ok": False, "msg": "找不到品項"}), 404
+
+    row = items[0]["row"]
+    col_qty = get_col("數量")
+
+    current = to_int(sheet.cell(row, col_qty).value)
+    new_qty = current + qty
+    sheet.update_cell(row, col_qty, new_qty)
+
+    return jsonify({
+        "ok": True,
+        "msg": "入庫成功",
+        "row": row,
+        "品名": name,
+        "new_qty": new_qty
+    })
+
+# =========================
+# API OUT
+# =========================
+@app.route("/api/out", methods=["POST"])
+def api_out():
+    data = request.get_json(silent=True) or {}
+
+    name = str(data.get("品名", "")).strip()
+    qty = to_int(data.get("數量", 0))
+
+    if not name:
+        return jsonify({"ok": False, "msg": "缺少品名"}), 400
+
+    if qty <= 0:
+        return jsonify({"ok": False, "msg": "數量需大於0"}), 400
+
+    items = find(name)
+    if not items:
+        return jsonify({"ok": False, "msg": "找不到品項"}), 404
+
+    row = items[0]["row"]
+    col_qty = get_col("數量")
+
+    current = to_int(sheet.cell(row, col_qty).value)
+    if current < qty:
+        return jsonify({"ok": False, "msg": "庫存不足"}), 400
+
+    new_qty = current - qty
+    sheet.update_cell(row, col_qty, new_qty)
+
+    return jsonify({
+        "ok": True,
+        "msg": "出庫成功",
+        "row": row,
+        "品名": name,
+        "new_qty": new_qty
+    })
 
 # =========================
 # RUN
