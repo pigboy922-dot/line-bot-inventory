@@ -38,8 +38,11 @@ if not GOOGLE_SHEET_ID:
 # =========================
 # LINE BOT 初始化
 # =========================
-line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
-handler = WebhookHandler(LINE_CHANNEL_SECRET)
+line_bot_api = None
+handler = None
+if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
+    line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
+    handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
 # =========================
 # Google Sheet 初始化
@@ -106,62 +109,51 @@ def required_columns_ok():
     required = ["品名", "尺寸", "數量", "位置"]
     return [c for c in required if c not in headers]
 
-def find_matching_rows(keyword):
-    data = sheet.get_all_records()
-    keyword = str(keyword).strip().lower()
-    result = []
-    for idx, row in enumerate(data, start=2):
-        name = str(row.get("品名", "")).strip()
-        size = str(row.get("尺寸", "")).strip()
-        qty = to_int(row.get("數量", 0))
-        loc = str(row.get("位置", "")).strip()
-        if keyword in name.lower() or keyword in size.lower():
-            result.append({
-                "row_number": idx,
-                "品名": name,
-                "尺寸": size,
-                "數量": qty,
-                "位置": loc
-            })
-    return result
-
-def get_item_by_row(row_number):
-    data = sheet.get_all_records()
-    for idx, row in enumerate(data, start=2):
-        if idx == row_number:
-            return {
-                "row_number": idx,
-                "品名": str(row.get("品名", "")).strip(),
-                "尺寸": str(row.get("尺寸", "")).strip(),
-                "數量": to_int(row.get("數量", 0)),
-                "位置": str(row.get("位置", "")).strip()
-            }
-    return None
-
 # =========================
-# 首頁與 PING
+# 首頁
 # =========================
 @app.route("/")
 def home():
     return jsonify({
         "ok": True,
-        "message": "LINE BOT + LIFF Inventory Running"
+        "message": "LINE BOT + LIFF Inventory Running",
+        "line_bot_enabled": bool(line_bot_api and handler),
+        "liff_enabled": True
     })
 
+# =========================
+# ✅ PING 健康檢查
+# =========================
 @app.route("/ping", methods=["GET"])
 def ping():
+    return jsonify({
+        "ok": True,
+        "message": "pong",
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    }), 200
+
+# =========================
+# ✅ 詳細健康檢查
+# =========================
+@app.route("/health", methods=["GET"])
+def health():
     try:
         missing = required_columns_ok()
         return jsonify({
             "ok": True,
-            "message": "pong",
+            "message": "OK",
+            "sheet_id": GOOGLE_SHEET_ID,
             "missing_columns": missing,
-            "line_bot_enabled": True,
+            "line_bot_enabled": bool(line_bot_api and handler),
             "liff_id_configured": bool(LIFF_ID),
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }), 200
     except Exception as e:
-        return jsonify({"ok": False, "message": str(e)}), 500
+        return jsonify({
+            "ok": False,
+            "message": str(e),
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }), 500
 
 # =========================
 # LIFF 頁面
@@ -175,82 +167,47 @@ def liff_page():
 # =========================
 @app.route("/callback", methods=["POST"])
 def callback():
-    signature = request.headers.get("X-Line-Signature")
+    if not handler:
+        return jsonify({"ok": False, "message": "LINE BOT 未設定完成"}), 500
+
+    signature = request.headers.get("X-Line-Signature", "")
     body = request.get_data(as_text=True)
+
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
         abort(400)
+
     return "OK"
 
 # =========================
-# 主選單
-# =========================
-def build_main_menu():
-    liff_url = f"https://liff.line.me/{LIFF_ID}"
-    return TemplateSendMessage(
-        alt_text="塊材管理選單",
-        template=ButtonsTemplate(
-            title="塊材管理",
-            text="請選擇功能",
-            actions=[
-                MessageTemplateAction(label="查詢庫存", text="查詢庫存"),
-                MessageTemplateAction(label="手動入庫", text="手動入庫"),
-                URIAction(label="塊材查詢", uri=liff_url),
-            ]
-        )
-    )
-
-# =========================
-# LINE 訊息處理
-# =========================
-@handler.add(MessageEvent, message=TextMessage)
-def handle_message(event):
-    text = event.message.text.strip()
-
-    if text in ["喚醒", "ping", "Ping", "PING"]:
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text="機器人已喚醒並正常運作！")
-        )
-        return
-
-    if text in ["塊材管理", "menu", "選單"]:
-        line_bot_api.reply_message(event.reply_token, build_main_menu())
-        return
-
-    if text == "查詢庫存":
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text="請輸入品名或尺寸關鍵字")
-        )
-        return
-
-    # 關鍵字搜尋
-    items = find_matching_rows(text)
-    if items:
-        lines = [
-            f"品名:{i['品名']}｜尺寸:{i['尺寸']}｜數量:{i['數量']}｜位置:{i['位置']}"
-            for i in items[:10]
-        ]
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text="\n".join(lines))
-        )
-    else:
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text="找不到符合的庫存資料")
-        )
-
-# =========================
-# API：搜尋
+# API：搜尋庫存
 # =========================
 @app.get("/api/search")
 def api_search():
+    missing = required_columns_ok()
+    if missing:
+        return jsonify({"ok": False, "message": f"Sheet 缺少欄位：{', '.join(missing)}"}), 400
+
     keyword = request.args.get("q", "").strip()
-    items = find_matching_rows(keyword) if keyword else []
-    return jsonify({"ok": True, "items": items})
+    if not keyword:
+        return jsonify({"ok": True, "items": []})
+
+    data = sheet.get_all_records()
+    keyword = keyword.lower()
+    items = []
+    for idx, row in enumerate(data, start=2):
+        name = str(row.get("品名", "")).strip()
+        size = str(row.get("尺寸", "")).strip()
+        if keyword in name.lower() or keyword in size.lower():
+            items.append({
+                "row_number": idx,
+                "品名": name,
+                "尺寸": size,
+                "數量": to_int(row.get("數量", 0)),
+                "位置": str(row.get("位置", "")).strip()
+            })
+    return jsonify({"ok": True, "items": items[:50]})
 
 # =========================
 # 主程式啟動
