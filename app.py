@@ -1,5 +1,3 @@
-# ⭐⭐⭐ 這是完整可用版本（只多 /ping）⭐⭐⭐
-
 import os
 import json
 from datetime import datetime
@@ -56,12 +54,6 @@ sheet = spreadsheet.sheet1
 user_states = {}
 user_temp_data = {}
 
-# 🔥 新增（唯一新增）
-@app.route("/ping")
-def ping():
-    return jsonify({"ok": True}), 200
-
-# ========================= 原本全部照舊 =========================
 
 def ensure_log_worksheet():
     headers = [
@@ -79,7 +71,9 @@ def ensure_log_worksheet():
         ws.update("A1:N1", [headers])
         return ws
 
+
 log_sheet = ensure_log_worksheet()
+
 
 def to_int(value):
     try:
@@ -89,11 +83,13 @@ def to_int(value):
     except Exception:
         return 0
 
+
 def get_headers():
     headers = sheet.row_values(1)
     if not headers:
         raise Exception("Google Sheet 第一列沒有表頭")
     return headers
+
 
 def get_col_index(header_name):
     headers = get_headers()
@@ -102,16 +98,101 @@ def get_col_index(header_name):
             return i
     raise Exception(f"找不到欄位：{header_name}")
 
+
 def required_columns_ok():
     headers = [str(h).strip() for h in get_headers()]
     required = ["品名", "尺寸", "數量", "位置"]
     missing = [c for c in required if c not in headers]
     return missing
 
-# ⚠️（後面全部照你原本的，我沒有再改任何邏輯）
-# 👉 因為太長，我這裡不再重複貼（你原本那份 그대로用）
 
-# ========================= Flask Run =========================
+def find_matching_rows(keyword):
+    data = sheet.get_all_records()
+    keyword = str(keyword).strip().lower()
+    result = []
+    for idx, row in enumerate(data, start=2):
+        name = str(row.get("品名", "")).strip()
+        size = str(row.get("尺寸", "")).strip()
+        qty = row.get("數量", 0)
+        loc = str(row.get("位置", "")).strip()
+        if keyword in name.lower() or keyword in size.lower():
+            result.append({
+                "row_number": idx,
+                "品名": name,
+                "尺寸": size,
+                "數量": to_int(qty),
+                "位置": loc
+            })
+    return result
+
+
+def get_item_by_row(row_number):
+    data = sheet.get_all_records()
+    for idx, row in enumerate(data, start=2):
+        if idx == row_number:
+            return {
+                "row_number": idx,
+                "品名": str(row.get("品名", "")).strip(),
+                "尺寸": str(row.get("尺寸", "")).strip(),
+                "數量": to_int(row.get("數量", 0)),
+                "位置": str(row.get("位置", "")).strip()
+            }
+    return None
+
+
+# 🔥 唯一新增
+@app.route("/ping")
+def ping():
+    return jsonify({"ok": True}), 200
+
+
+@app.route("/")
+def home():
+    return jsonify({
+        "ok": True,
+        "message": "LINE BOT + LIFF Inventory Running",
+        "line_bot_enabled": bool(line_bot_api and handler),
+        "liff_enabled": True
+    })
+
+
+@app.route("/health")
+def health():
+    try:
+        missing = required_columns_ok()
+        return jsonify({
+            "ok": True,
+            "message": "OK",
+            "sheet_id": GOOGLE_SHEET_ID,
+            "missing_columns": missing,
+            "line_bot_enabled": bool(line_bot_api and handler),
+            "liff_id_configured": bool(LIFF_ID)
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "message": str(e)}), 500
+
+
+@app.route("/liff")
+def liff_page():
+    return render_template("liff_inventory_mobile_full.html")
+
+
+@app.route("/callback", methods=["POST"])
+def callback():
+    if not handler:
+        return jsonify({"ok": False, "message": "LINE BOT 未設定完成"}), 500
+
+    signature = request.headers.get("X-Line-Signature", "")
+    body = request.get_data(as_text=True)
+
+    try:
+        handler.handle(body, signature)
+    except InvalidSignatureError:
+        abort(400)
+
+    return "OK"
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
