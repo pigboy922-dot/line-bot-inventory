@@ -67,9 +67,7 @@ sheet = spreadsheet.sheet1
 user_states = {}
 user_temp_data = {}
 
-# =========================
-# ⭐⭐⭐ 新增：PING（防 502 核心）⭐⭐⭐
-# =========================
+
 @app.route("/ping")
 def ping():
     return jsonify({
@@ -78,9 +76,6 @@ def ping():
     }), 200
 
 
-# =========================
-# health（保留）
-# =========================
 @app.route("/health")
 def health():
     try:
@@ -94,9 +89,6 @@ def health():
         return jsonify({"ok": False, "message": str(e)}), 500
 
 
-# =========================
-# 首頁
-# =========================
 @app.route("/")
 def home():
     return jsonify({
@@ -105,17 +97,11 @@ def home():
     })
 
 
-# =========================
-# LIFF
-# =========================
 @app.route("/liff")
 def liff_page():
     return render_template("liff_inventory_mobile_full.html")
 
 
-# =========================
-# 工具
-# =========================
 def to_int(v):
     try:
         return int(float(str(v)))
@@ -143,18 +129,6 @@ def find_rows(keyword):
     return result
 
 
-def get_row(row_number):
-    data = sheet.get_all_records()
-    for idx, row in enumerate(data, start=2):
-        if idx == row_number:
-            return row
-    return None
-
-
-# =========================
-# API（LIFF 用）
-# =========================
-
 @app.get("/api/search")
 def api_search():
     keyword = request.args.get("keyword", "")
@@ -165,54 +139,69 @@ def api_search():
 @app.get("/api/stock")
 def api_stock():
     data = sheet.get_all_records()
-    return jsonify({"ok": True, "rows": data})
+    rows = []
+    for idx, row in enumerate(data, start=2):
+        rows.append({
+            "row_number": idx,
+            "品名": str(row.get("品名", "")),
+            "尺寸": str(row.get("尺寸", "")),
+            "數量": to_int(row.get("數量", 0)),
+            "位置": str(row.get("位置", ""))
+        })
+    return jsonify({"ok": True, "rows": rows})
 
 
 @app.post("/api/in")
 def api_in():
-    body = request.json
-    row = int(body.get("row_number"))
-    qty = int(body.get("qty"))
+    body = request.get_json(silent=True) or {}
+    row = int(body.get("row_number", 0))
+    qty = int(body.get("qty", 0))
+
+    if row < 2 or qty <= 0:
+        return jsonify({"ok": False, "message": "參數錯誤"}), 400
 
     current = to_int(sheet.cell(row, 3).value)
     new_qty = current + qty
-
     sheet.update_cell(row, 3, new_qty)
 
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "new_qty": new_qty})
 
 
 @app.post("/api/out")
 def api_out():
-    body = request.json
-    row = int(body.get("row_number"))
-    qty = int(body.get("qty"))
+    body = request.get_json(silent=True) or {}
+    row = int(body.get("row_number", 0))
+    qty = int(body.get("qty", 0))
+
+    if row < 2 or qty <= 0:
+        return jsonify({"ok": False, "message": "參數錯誤"}), 400
 
     current = to_int(sheet.cell(row, 3).value)
-    new_qty = max(0, current - qty)
+    if qty > current:
+        return jsonify({"ok": False, "message": f"出庫失敗，目前庫存只有 {current}"}), 400
 
+    new_qty = current - qty
     sheet.update_cell(row, 3, new_qty)
 
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "new_qty": new_qty})
 
 
 @app.post("/api/manual-in")
 def api_manual_in():
-    body = request.json
+    body = request.get_json(silent=True) or {}
 
-    name = body.get("name")
-    size = body.get("size")
-    qty = int(body.get("qty"))
-    loc = body.get("loc")
+    name = str(body.get("name", "")).strip()
+    size = str(body.get("size", "")).strip()
+    qty = int(body.get("qty", 0))
+    loc = str(body.get("loc", "")).strip()
+
+    if not name or qty <= 0:
+        return jsonify({"ok": False, "message": "品名與數量必填"}), 400
 
     sheet.append_row([name, size, qty, loc])
-
     return jsonify({"ok": True})
 
 
-# =========================
-# LINE BOT callback（保留）
-# =========================
 @app.route("/callback", methods=["POST"])
 def callback():
     if not handler:
@@ -227,3 +216,8 @@ def callback():
         abort(400)
 
     return "OK"
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
