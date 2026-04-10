@@ -35,7 +35,7 @@ LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "").strip()
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "").strip()
 LIFF_ID = os.getenv("LIFF_ID", "").strip()
-LIFF_CHANNEL_ID = os.getenv("LIFF_CHANNEL_ID", "").strip()  # 建議填 LINE Login Channel ID
+LIFF_CHANNEL_ID = os.getenv("LIFF_CHANNEL_ID", "").strip()
 APP_BASE_URL = os.getenv("APP_BASE_URL", "").strip().rstrip("/")
 
 PAGE_SIZE = 10
@@ -128,6 +128,7 @@ def ensure_log_worksheet():
         "user_key", "動作", "品名", "尺寸", "原數量",
         "異動數量", "新數量", "位置", "備註"
     ]
+
     try:
         ws = spreadsheet.worksheet("出入庫紀錄")
         first_row = ws.row_values(1)
@@ -223,24 +224,43 @@ def verify_liff_id_token(raw_token):
     if not raw_token:
         return {"ok": False, "message": "缺少 LIFF ID Token"}
 
-    audience = LIFF_CHANNEL_ID or LIFF_ID
-    if not audience:
-        return {"ok": False, "message": "伺服器未設定 LIFF_CHANNEL_ID 或 LIFF_ID"}
+    audiences = []
 
-    try:
-        payload = google_id_token.verify_oauth2_token(
-            raw_token,
-            google_requests.Request(),
-            audience=audience
-        )
-        return {
-            "ok": True,
-            "sub": payload.get("sub", ""),
-            "name": payload.get("name", ""),
-            "picture": payload.get("picture", "")
-        }
-    except Exception as e:
-        return {"ok": False, "message": f"LIFF Token 驗證失敗：{str(e)}"}
+    if LIFF_CHANNEL_ID:
+        audiences.append(LIFF_CHANNEL_ID.strip())
+
+    if LIFF_ID:
+        liff_id = LIFF_ID.strip()
+        if liff_id not in audiences:
+            audiences.append(liff_id)
+
+    if not audiences:
+        return {"ok": False, "message": "未設定 LIFF_CHANNEL_ID 或 LIFF_ID"}
+
+    last_error = None
+
+    for aud in audiences:
+        try:
+            payload = google_id_token.verify_oauth2_token(
+                raw_token,
+                google_requests.Request(),
+                audience=aud
+            )
+            return {
+                "ok": True,
+                "sub": payload.get("sub", ""),
+                "name": payload.get("name", ""),
+                "picture": payload.get("picture", ""),
+                "aud": payload.get("aud", ""),
+                "used_audience": aud
+            }
+        except Exception as e:
+            last_error = str(e)
+
+    return {
+        "ok": False,
+        "message": f"LIFF Token 驗證失敗：{last_error}"
+    }
 
 
 def get_actor_info():
@@ -981,26 +1001,49 @@ def api_in():
     try:
         missing = required_columns_ok()
         if missing:
-            return jsonify({"ok": False, "message": f"Sheet 缺少欄位：{', '.join(missing)}"}), 400
+            return jsonify({
+                "ok": False,
+                "message": f"Sheet 缺少欄位：{', '.join(missing)}"
+            }), 400
 
         data = request.get_json(silent=True) or {}
         actor = get_actor_info()
+
+        raw_token = request.headers.get("X-LIFF-ID-Token", "").strip()
+        if raw_token and not actor.get("verify", {}).get("ok", False):
+            return jsonify({
+                "ok": False,
+                "message": actor.get("verify", {}).get("message", "LIFF Token 驗證失敗"),
+                "actor_verify": actor.get("verify", {})
+            }), 401
 
         try:
             row_num = int(data.get("row_number", 0))
             add_qty = int(data.get("qty", 0))
         except Exception:
-            return jsonify({"ok": False, "message": "row_number 或 qty 格式錯誤"}), 400
+            return jsonify({
+                "ok": False,
+                "message": "row_number 或 qty 格式錯誤"
+            }), 400
 
         if row_num < 2:
-            return jsonify({"ok": False, "message": "row_number 錯誤"}), 400
+            return jsonify({
+                "ok": False,
+                "message": "row_number 錯誤"
+            }), 400
 
         if add_qty <= 0:
-            return jsonify({"ok": False, "message": "入庫數量必須大於 0"}), 400
+            return jsonify({
+                "ok": False,
+                "message": "入庫數量必須大於 0"
+            }), 400
 
         item = get_item_by_row(row_num)
         if not item:
-            return jsonify({"ok": False, "message": "找不到該筆資料"}), 404
+            return jsonify({
+                "ok": False,
+                "message": "找不到該筆資料"
+            }), 404
 
         sheet = get_sheet()
         qty_col = get_col_index("數量")
@@ -1027,8 +1070,12 @@ def api_in():
             "item": item,
             "actor_verify": actor.get("verify", {})
         })
+
     except Exception as e:
-        return jsonify({"ok": False, "message": str(e)}), 500
+        return jsonify({
+            "ok": False,
+            "message": str(e)
+        }), 500
 
 
 @app.post("/api/out")
@@ -1036,33 +1083,59 @@ def api_out():
     try:
         missing = required_columns_ok()
         if missing:
-            return jsonify({"ok": False, "message": f"Sheet 缺少欄位：{', '.join(missing)}"}), 400
+            return jsonify({
+                "ok": False,
+                "message": f"Sheet 缺少欄位：{', '.join(missing)}"
+            }), 400
 
         data = request.get_json(silent=True) or {}
         actor = get_actor_info()
+
+        raw_token = request.headers.get("X-LIFF-ID-Token", "").strip()
+        if raw_token and not actor.get("verify", {}).get("ok", False):
+            return jsonify({
+                "ok": False,
+                "message": actor.get("verify", {}).get("message", "LIFF Token 驗證失敗"),
+                "actor_verify": actor.get("verify", {})
+            }), 401
 
         try:
             row_num = int(data.get("row_number", 0))
             out_qty = int(data.get("qty", 0))
         except Exception:
-            return jsonify({"ok": False, "message": "row_number 或 qty 格式錯誤"}), 400
+            return jsonify({
+                "ok": False,
+                "message": "row_number 或 qty 格式錯誤"
+            }), 400
 
         if row_num < 2:
-            return jsonify({"ok": False, "message": "row_number 錯誤"}), 400
+            return jsonify({
+                "ok": False,
+                "message": "row_number 錯誤"
+            }), 400
 
         if out_qty <= 0:
-            return jsonify({"ok": False, "message": "出庫數量必須大於 0"}), 400
+            return jsonify({
+                "ok": False,
+                "message": "出庫數量必須大於 0"
+            }), 400
 
         item = get_item_by_row(row_num)
         if not item:
-            return jsonify({"ok": False, "message": "找不到該筆資料"}), 404
+            return jsonify({
+                "ok": False,
+                "message": "找不到該筆資料"
+            }), 404
 
         sheet = get_sheet()
         qty_col = get_col_index("數量")
         old_qty = to_int(sheet.cell(row_num, qty_col).value)
 
         if out_qty > old_qty:
-            return jsonify({"ok": False, "message": f"目前庫存只有 {old_qty}，不能出庫 {out_qty}"}), 400
+            return jsonify({
+                "ok": False,
+                "message": f"目前庫存只有 {old_qty}，不能出庫 {out_qty}"
+            }), 400
 
         new_qty = old_qty - out_qty
         sheet.update_cell(row_num, qty_col, new_qty)
@@ -1086,8 +1159,12 @@ def api_out():
             "item": item,
             "actor_verify": actor.get("verify", {})
         })
+
     except Exception as e:
-        return jsonify({"ok": False, "message": str(e)}), 500
+        return jsonify({
+            "ok": False,
+            "message": str(e)
+        }), 500
 
 
 @app.post("/api/manual-in")
@@ -1099,6 +1176,14 @@ def api_manual_in():
 
         data = request.get_json(silent=True) or {}
         actor = get_actor_info()
+
+        raw_token = request.headers.get("X-LIFF-ID-Token", "").strip()
+        if raw_token and not actor.get("verify", {}).get("ok", False):
+            return jsonify({
+                "ok": False,
+                "message": actor.get("verify", {}).get("message", "LIFF Token 驗證失敗"),
+                "actor_verify": actor.get("verify", {})
+            }), 401
 
         name = str(data.get("name", "")).strip()
         size = str(data.get("size", "")).strip()
