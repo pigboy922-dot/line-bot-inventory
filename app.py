@@ -20,6 +20,9 @@ from google.oauth2 import id_token as google_id_token
 app = Flask(__name__)
 CORS(app)
 
+# =========================
+# 環境變數設定
+# =========================
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "")
@@ -32,12 +35,18 @@ if not GOOGLE_CREDENTIALS_JSON:
 if not GOOGLE_SHEET_ID:
     raise ValueError("缺少環境變數 GOOGLE_SHEET_ID")
 
+# =========================
+# LINE BOT 初始化
+# =========================
 line_bot_api = None
 handler = None
 if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
     line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
     handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
+# =========================
+# Google Sheet 初始化
+# =========================
 scope = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive"
@@ -51,6 +60,9 @@ sheet = spreadsheet.sheet1
 user_states = {}
 user_temp_data = {}
 
+# =========================
+# 建立出入庫紀錄工作表
+# =========================
 def ensure_log_worksheet():
     headers = [
         "時間", "聊天室類型", "群組名稱", "群組ID", "room_id", "user_key",
@@ -69,6 +81,9 @@ def ensure_log_worksheet():
 
 log_sheet = ensure_log_worksheet()
 
+# =========================
+# 工具函式
+# =========================
 def to_int(value):
     try:
         if value is None or value == "":
@@ -96,9 +111,21 @@ def required_columns_ok():
     missing = [c for c in required if c not in headers]
     return missing
 
-# -------------------------------
-# ✅ 這裡是唯一修改的部分：/health ➜ /ping
-# -------------------------------
+# =========================
+# 首頁
+# =========================
+@app.route("/")
+def home():
+    return jsonify({
+        "ok": True,
+        "message": "LINE BOT + LIFF Inventory Running",
+        "line_bot_enabled": bool(line_bot_api and handler),
+        "liff_enabled": True
+    })
+
+# =========================
+# ✅ PING 健康檢查（取代 /health）
+# =========================
 @app.route("/ping", methods=["GET"])
 def ping():
     """
@@ -123,23 +150,71 @@ def ping():
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }), 500
 
-# -------------------------------
-# 其餘程式碼保持不變
-# -------------------------------
+# =========================
+# LIFF 頁面
+# =========================
+@app.route("/liff")
+def liff_page():
+    return render_template("liff_inventory_mobile_full.html")
 
-@app.route("/")
-def home():
-    return jsonify({
-        "ok": True,
-        "message": "LINE BOT + LIFF Inventory Running",
-        "line_bot_enabled": bool(line_bot_api and handler),
-        "liff_enabled": True
-    })
+# =========================
+# LINE Webhook
+# =========================
+@app.route("/callback", methods=["POST"])
+def callback():
+    if not handler:
+        return jsonify({"ok": False, "message": "LINE BOT 未設定完成"}), 500
 
-# ...（以下所有你原本的程式碼保持不變，包含 callback、handle_message、
-# /api/search、/api/stock、/api/in、/api/out、/api/manual-in 等）
-# 由於內容較長，直接使用你提供的原始版本即可，唯一需要修改的只有 /health ➜ /ping。
+    signature = request.headers.get("X-Line-Signature", "")
+    body = request.get_data(as_text=True)
 
+    try:
+        handler.handle(body, signature)
+    except InvalidSignatureError:
+        abort(400)
+
+    return "OK"
+
+# =========================
+# API：搜尋庫存
+# =========================
+@app.get("/api/search")
+def api_search():
+    missing = required_columns_ok()
+    if missing:
+        return jsonify({"ok": False, "message": f"Sheet 缺少欄位：{', '.join(missing)}"}), 400
+
+    keyword = request.args.get("q", "").strip()
+    if not keyword:
+        return jsonify({"ok": True, "items": []})
+    items = find_matching_rows(keyword)
+    return jsonify({"ok": True, "items": items[:50]})
+
+# =========================
+# API：取得庫存
+# =========================
+@app.get("/api/stock")
+def api_stock():
+    missing = required_columns_ok()
+    if missing:
+        return jsonify({"ok": False, "message": f"Sheet 缺少欄位：{', '.join(missing)}"}), 400
+
+    data = sheet.get_all_records()
+    items = []
+    for idx, row in enumerate(data, start=2):
+        items.append({
+            "row_number": idx,
+            "品名": str(row.get("品名", "")).strip(),
+            "尺寸": str(row.get("尺寸", "")).strip(),
+            "數量": to_int(row.get("數量", 0)),
+            "位置": str(row.get("位置", "")).strip()
+        })
+
+    return jsonify({"ok": True, "items": items})
+
+# =========================
+# 主程式啟動
+# =========================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
