@@ -1,5 +1,7 @@
 import os
 import json
+import time
+import threading
 from datetime import datetime
 
 from flask import Flask, request, abort, jsonify, render_template
@@ -38,7 +40,9 @@ LIFF_ID = os.getenv("LIFF_ID", "").strip()
 LIFF_CHANNEL_ID = os.getenv("LIFF_CHANNEL_ID", "").strip()
 APP_BASE_URL = os.getenv("APP_BASE_URL", "").strip().rstrip("/")
 
-PAGE_SIZE = 10
+PORT = int(os.getenv("PORT", "10000"))
+PAGE_SIZE = int(os.getenv("PAGE_SIZE", "10"))
+CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "15"))
 
 
 # =========================
@@ -51,6 +55,7 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
     try:
         line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
         handler = WebhookHandler(LINE_CHANNEL_SECRET)
+        print("[LINE] initialized")
     except Exception as e:
         print(f"[LINE INIT ERROR] {e}")
         line_bot_api = None
@@ -58,9 +63,9 @@ if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
 
 
 # =========================
-# Google Sheet Lazy Init
+# Google Sheet Init / Cache
 # =========================
-_scope = [
+_SCOPE = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive"
 ]
@@ -70,6 +75,48 @@ _spreadsheet = None
 _sheet = None
 _log_sheet = None
 
+_cache_lock = threading.Lock()
+_sheet_cache = {
+    "headers": None,
+    "headers_ts": 0,
+    "records": None,
+    "records_ts": 0
+}
+
+
+# =========================
+# Runtime flags
+# =========================
+runtime_status = {
+    "startup_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    "warmup_started": False,
+    "warmup_done": False,
+    "warmup_error": "",
+    "last_warmup_time": "",
+    "template_loaded": False,
+    "sheet_connected": False
+}
+
+
+# =========================
+# Helpers
+# =========================
+user_states = {}
+user_temp_data = {}
+
+
+def to_int(value):
+    try:
+        if value is None or value == "":
+            return 0
+        return int(float(str(value).strip()))
+    except Exception:
+        return 0
+
+
+def now_str():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
 
 def get_liff_url():
     if LIFF_ID:
@@ -77,6 +124,14 @@ def get_liff_url():
     if APP_BASE_URL:
         return f"{APP_BASE_URL}/liff"
     return "/liff"
+
+
+def clear_sheet_cache():
+    with _cache_lock:
+        _sheet_cache["headers"] = None
+        _sheet_cache["headers_ts"] = 0
+        _sheet_cache["records"] = None
+        _sheet_cache["records_ts"] = 0
 
 
 def init_gspread():
@@ -96,7 +151,7 @@ def init_gspread():
     except Exception as e:
         raise ValueError(f"GOOGLE_CREDENTIALS_JSON 格式錯誤：{e}")
 
-    credentials = Credentials.from_service_account_info(creds_info, scopes=_scope)
+    credentials = Credentials.from_service_account_info(creds_info, scopes=_SCOPE)
     gc = gspread.authorize(credentials)
     spreadsheet = gc.open_by_key(GOOGLE_SHEET_ID)
     sheet = spreadsheet.sheet1
@@ -104,6 +159,8 @@ def init_gspread():
     _gc = gc
     _spreadsheet = spreadsheet
     _sheet = sheet
+    runtime_status["sheet_connected"] = True
+
     return _gc, _spreadsheet, _sheet
 
 
@@ -119,6 +176,7 @@ def get_sheet():
 
 def ensure_log_worksheet():
     global _log_sheet
+
     if _log_sheet is not None:
         return _log_sheet
 
@@ -142,28 +200,40 @@ def ensure_log_worksheet():
     return _log_sheet
 
 
-# =========================
-# Helpers
-# =========================
-user_states = {}
-user_temp_data = {}
+def get_headers(force_refresh=False):
+    with _cache_lock:
+        cached = _sheet_cache["headers"]
+        ts = _sheet_cache["headers_ts"]
 
+    if (not force_refresh) and cached and (time.time() - ts < CACHE_TTL_SECONDS):
+        return cached
 
-def to_int(value):
-    try:
-        if value is None or value == "":
-            return 0
-        return int(float(str(value).strip()))
-    except Exception:
-        return 0
-
-
-def get_headers():
-    sheet = get_sheet()
-    headers = sheet.row_values(1)
+    headers = get_sheet().row_values(1)
     if not headers:
         raise Exception("Google Sheet 第一列沒有表頭")
+
+    with _cache_lock:
+        _sheet_cache["headers"] = headers
+        _sheet_cache["headers_ts"] = time.time()
+
     return headers
+
+
+def get_records(force_refresh=False):
+    with _cache_lock:
+        cached = _sheet_cache["records"]
+        ts = _sheet_cache["records_ts"]
+
+    if (not force_refresh) and cached is not None and (time.time() - ts < CACHE_TTL_SECONDS):
+        return cached
+
+    records = get_sheet().get_all_records()
+
+    with _cache_lock:
+        _sheet_cache["records"] = records
+        _sheet_cache["records_ts"] = time.time()
+
+    return records
 
 
 def get_col_index(header_name):
@@ -182,8 +252,7 @@ def required_columns_ok():
 
 
 def find_matching_rows(keyword):
-    sheet = get_sheet()
-    data = sheet.get_all_records()
+    data = get_records()
     keyword = str(keyword).strip().lower()
     result = []
 
@@ -201,12 +270,12 @@ def find_matching_rows(keyword):
                 "數量": to_int(qty),
                 "位置": loc
             })
+
     return result
 
 
 def get_item_by_row(row_number):
-    sheet = get_sheet()
-    data = sheet.get_all_records()
+    data = get_records()
 
     for idx, row in enumerate(data, start=2):
         if idx == row_number:
@@ -217,6 +286,7 @@ def get_item_by_row(row_number):
                 "數量": to_int(row.get("數量", 0)),
                 "位置": str(row.get("位置", "")).strip()
             }
+
     return None
 
 
@@ -225,10 +295,8 @@ def verify_liff_id_token(raw_token):
         return {"ok": False, "message": "缺少 LIFF ID Token"}
 
     audiences = []
-
     if LIFF_CHANNEL_ID:
         audiences.append(LIFF_CHANNEL_ID.strip())
-
     if LIFF_ID:
         liff_id = LIFF_ID.strip()
         if liff_id not in audiences:
@@ -257,6 +325,12 @@ def verify_liff_id_token(raw_token):
         except Exception as e:
             last_error = str(e)
 
+    if last_error and "cryptography package" in last_error:
+        return {
+            "ok": False,
+            "message": "LIFF Token 驗證失敗：伺服器缺少 cryptography 套件，請先安裝 requirements.txt 後重新部署"
+        }
+
     return {
         "ok": False,
         "message": f"LIFF Token 驗證失敗：{last_error}"
@@ -265,7 +339,7 @@ def verify_liff_id_token(raw_token):
 
 def get_actor_info():
     token = request.headers.get("X-LIFF-ID-Token", "").strip()
-    verify = verify_liff_id_token(token) if token else {"ok": False}
+    verify = verify_liff_id_token(token) if token else {"ok": False, "message": "未提供 LIFF Token"}
     body = request.get_json(silent=True) or {}
 
     return {
@@ -298,6 +372,7 @@ def get_chatroom_info(event):
 
     if source.type == "group":
         info["群組ID"] = getattr(source, "group_id", "")
+        # 企業穩定版：群組名稱抓不到也不能卡住主流程
         if line_bot_api:
             try:
                 summary = line_bot_api.get_group_summary(source.group_id)
@@ -314,7 +389,6 @@ def log_inventory_action_line(event, action, item=None, old_qty="", change_qty="
     try:
         log_sheet = ensure_log_worksheet()
         chat = get_chatroom_info(event)
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         name = ""
         size = ""
@@ -325,7 +399,7 @@ def log_inventory_action_line(event, action, item=None, old_qty="", change_qty="
             loc = str(item.get("位置", "")).strip()
 
         log_sheet.append_row([
-            now, chat["聊天室類型"], chat["群組名稱"], chat["群組ID"],
+            now_str(), chat["聊天室類型"], chat["群組名稱"], chat["群組ID"],
             chat["room_id"], chat["user_key"], action, name, size,
             old_qty, change_qty, new_qty, loc, note
         ])
@@ -337,7 +411,6 @@ def log_inventory_action_liff(action, item=None, old_qty="", change_qty="", new_
     try:
         log_sheet = ensure_log_worksheet()
         actor = actor or {}
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         name = ""
         size = ""
@@ -348,7 +421,7 @@ def log_inventory_action_liff(action, item=None, old_qty="", change_qty="", new_
             loc = str(item.get("位置", "")).strip()
 
         log_sheet.append_row([
-            now, "liff", "", "", "",
+            now_str(), "liff", "", "", "",
             actor.get("line_user_id", ""), action, name, size,
             old_qty, change_qty, new_qty, loc,
             note or actor.get("line_name", "")
@@ -395,6 +468,7 @@ def build_liff_open_card():
 
 def build_search_results_carousel(items, mode="out"):
     columns = []
+
     for item in items[:10]:
         title = f"{item['品名'][:20]}" or "查詢結果"
         text = f"尺寸:{item['尺寸'][:20]}\n數量:{item['數量']}\n位置:{item['位置'][:20]}"
@@ -426,8 +500,7 @@ def build_search_results_carousel(items, mode="out"):
 
 
 def build_all_stock_carousel(page=1):
-    sheet = get_sheet()
-    data = sheet.get_all_records()
+    data = get_records()
     total_count = len(data)
     total_pages = max(1, (total_count + PAGE_SIZE - 1) // PAGE_SIZE)
 
@@ -481,6 +554,72 @@ def build_all_stock_carousel(page=1):
     return messages
 
 
+def preload_template():
+    with app.app_context():
+        app.jinja_env.get_template("liff_inventory_mobile_full.html")
+        runtime_status["template_loaded"] = True
+
+
+def warmup_everything():
+    runtime_status["warmup_started"] = True
+    runtime_status["warmup_error"] = ""
+
+    try:
+        preload_template()
+        init_gspread()
+        required_columns_ok()
+        ensure_log_worksheet()
+        get_records(force_refresh=True)
+        runtime_status["warmup_done"] = True
+        runtime_status["last_warmup_time"] = now_str()
+        print("[WARMUP] done")
+    except Exception as e:
+        runtime_status["warmup_done"] = False
+        runtime_status["warmup_error"] = str(e)
+        print(f"[WARMUP ERROR] {e}")
+
+
+def start_background_warmup():
+    def _runner():
+        time.sleep(1)
+        warmup_everything()
+
+    t = threading.Thread(target=_runner, daemon=True)
+    t.start()
+
+
+def update_stock_qty(row_num, delta, action_name):
+    item = get_item_by_row(row_num)
+    if not item:
+        return {"ok": False, "message": "找不到該筆資料"}, 404
+
+    sheet = get_sheet()
+    qty_col = get_col_index("數量")
+    old_qty = to_int(sheet.cell(row_num, qty_col).value)
+
+    if action_name == "出庫":
+        if delta <= 0:
+            return {"ok": False, "message": "出庫數量必須大於 0"}, 400
+        if delta > old_qty:
+            return {"ok": False, "message": f"目前庫存只有 {old_qty}，不能出庫 {delta}"}, 400
+        new_qty = old_qty - delta
+    else:
+        if delta <= 0:
+            return {"ok": False, "message": "入庫數量必須大於 0"}, 400
+        new_qty = old_qty + delta
+
+    sheet.update_cell(row_num, qty_col, new_qty)
+    clear_sheet_cache()
+
+    item["數量"] = new_qty
+    return {
+        "ok": True,
+        "item": item,
+        "old_qty": old_qty,
+        "new_qty": new_qty
+    }, 200
+
+
 # =========================
 # Routes
 # =========================
@@ -490,13 +629,32 @@ def home():
         "ok": True,
         "message": "LINE BOT + LIFF Inventory Running",
         "line_bot_enabled": bool(line_bot_api and handler),
-        "liff_enabled": True
+        "liff_enabled": True,
+        "warmup_done": runtime_status["warmup_done"],
+        "warmup_error": runtime_status["warmup_error"]
     })
 
 
 @app.route("/ping")
 def ping():
     return "ok", 200
+
+
+@app.route("/warmup")
+def warmup():
+    try:
+        warmup_everything()
+        return jsonify({
+            "ok": True,
+            "message": "warmup done",
+            "runtime_status": runtime_status
+        })
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "message": str(e),
+            "runtime_status": runtime_status
+        }), 500
 
 
 @app.route("/health")
@@ -509,6 +667,7 @@ def health():
         "has_google_sheet_id": bool(GOOGLE_SHEET_ID),
         "has_liff_id": bool(LIFF_ID),
         "has_liff_channel_id": bool(LIFF_CHANNEL_ID),
+        "runtime_status": runtime_status
     })
 
 
@@ -520,12 +679,14 @@ def healthz_sheet():
             "ok": True,
             "message": "sheet connected",
             "sheet_id": GOOGLE_SHEET_ID,
-            "missing_columns": missing
+            "missing_columns": missing,
+            "runtime_status": runtime_status
         })
     except Exception as e:
         return jsonify({
             "ok": False,
-            "message": str(e)
+            "message": str(e),
+            "runtime_status": runtime_status
         }), 500
 
 
@@ -744,25 +905,17 @@ def handle_message(event):
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請輸入正整數"))
             return
 
-        if add_qty <= 0:
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="入庫數量必須大於 0"))
-            return
-
         temp = user_temp_data.get(user_key, {})
         row_num = temp.get("row_number")
-        item = get_item_by_row(row_num)
 
-        if not item:
-            reset_user_state(user_key)
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="找不到該筆資料"))
+        result, code = update_stock_qty(row_num, add_qty, "入庫")
+        if not result["ok"]:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=result["message"]))
             return
 
-        sheet = get_sheet()
-        qty_col = get_col_index("數量")
-        old_qty = to_int(sheet.cell(row_num, qty_col).value)
-        new_qty = old_qty + add_qty
-        sheet.update_cell(row_num, qty_col, new_qty)
-        item["數量"] = new_qty
+        item = result["item"]
+        old_qty = result["old_qty"]
+        new_qty = result["new_qty"]
 
         log_inventory_action_line(
             event, "入庫",
@@ -796,33 +949,17 @@ def handle_message(event):
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請輸入正整數"))
             return
 
-        if out_qty <= 0:
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="出庫數量必須大於 0"))
-            return
-
         temp = user_temp_data.get(user_key, {})
         row_num = temp.get("row_number")
-        item = get_item_by_row(row_num)
 
-        if not item:
-            reset_user_state(user_key)
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="找不到該筆資料"))
+        result, code = update_stock_qty(row_num, out_qty, "出庫")
+        if not result["ok"]:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=result["message"]))
             return
 
-        sheet = get_sheet()
-        qty_col = get_col_index("數量")
-        old_qty = to_int(sheet.cell(row_num, qty_col).value)
-
-        if out_qty > old_qty:
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(text=f"目前庫存只有 {old_qty}，不能出庫 {out_qty}")
-            )
-            return
-
-        new_qty = old_qty - out_qty
-        sheet.update_cell(row_num, qty_col, new_qty)
-        item["數量"] = new_qty
+        item = result["item"]
+        old_qty = result["old_qty"]
+        new_qty = result["new_qty"]
 
         log_inventory_action_line(
             event, "出庫",
@@ -893,6 +1030,7 @@ def handle_message(event):
 
         sheet = get_sheet()
         sheet.append_row(new_row)
+        clear_sheet_cache()
 
         item = {"品名": name, "尺寸": size, "數量": qty, "位置": loc}
 
@@ -965,8 +1103,7 @@ def api_stock():
         except Exception:
             return jsonify({"ok": False, "message": "page 或 page_size 格式錯誤"}), 400
 
-        sheet = get_sheet()
-        data = sheet.get_all_records()
+        data = get_records()
         total_count = len(data)
         total_pages = max(1, (total_count + page_size - 1) // page_size)
         page = min(page, total_pages)
@@ -1027,30 +1164,15 @@ def api_in():
             }), 400
 
         if row_num < 2:
-            return jsonify({
-                "ok": False,
-                "message": "row_number 錯誤"
-            }), 400
+            return jsonify({"ok": False, "message": "row_number 錯誤"}), 400
 
-        if add_qty <= 0:
-            return jsonify({
-                "ok": False,
-                "message": "入庫數量必須大於 0"
-            }), 400
+        result, code = update_stock_qty(row_num, add_qty, "入庫")
+        if not result["ok"]:
+            return jsonify(result), code
 
-        item = get_item_by_row(row_num)
-        if not item:
-            return jsonify({
-                "ok": False,
-                "message": "找不到該筆資料"
-            }), 404
-
-        sheet = get_sheet()
-        qty_col = get_col_index("數量")
-        old_qty = to_int(sheet.cell(row_num, qty_col).value)
-        new_qty = old_qty + add_qty
-        sheet.update_cell(row_num, qty_col, new_qty)
-        item["數量"] = new_qty
+        item = result["item"]
+        old_qty = result["old_qty"]
+        new_qty = result["new_qty"]
 
         log_inventory_action_liff(
             "入庫",
@@ -1109,37 +1231,15 @@ def api_out():
             }), 400
 
         if row_num < 2:
-            return jsonify({
-                "ok": False,
-                "message": "row_number 錯誤"
-            }), 400
+            return jsonify({"ok": False, "message": "row_number 錯誤"}), 400
 
-        if out_qty <= 0:
-            return jsonify({
-                "ok": False,
-                "message": "出庫數量必須大於 0"
-            }), 400
+        result, code = update_stock_qty(row_num, out_qty, "出庫")
+        if not result["ok"]:
+            return jsonify(result), code
 
-        item = get_item_by_row(row_num)
-        if not item:
-            return jsonify({
-                "ok": False,
-                "message": "找不到該筆資料"
-            }), 404
-
-        sheet = get_sheet()
-        qty_col = get_col_index("數量")
-        old_qty = to_int(sheet.cell(row_num, qty_col).value)
-
-        if out_qty > old_qty:
-            return jsonify({
-                "ok": False,
-                "message": f"目前庫存只有 {old_qty}，不能出庫 {out_qty}"
-            }), 400
-
-        new_qty = old_qty - out_qty
-        sheet.update_cell(row_num, qty_col, new_qty)
-        item["數量"] = new_qty
+        item = result["item"]
+        old_qty = result["old_qty"]
+        new_qty = result["new_qty"]
 
         log_inventory_action_liff(
             "出庫",
@@ -1172,11 +1272,12 @@ def api_manual_in():
     try:
         missing = required_columns_ok()
         if missing:
-            return jsonify({"ok": False, "message": f"Sheet 缺少欄位：{', '.join(missing)}"}), 400
+            return jsonify({
+                "ok": False,
+                "message": f"Sheet 缺少欄位：{', '.join(missing)}"
+            }), 400
 
-        data = request.get_json(silent=True) or {}
         actor = get_actor_info()
-
         raw_token = request.headers.get("X-LIFF-ID-Token", "").strip()
         if raw_token and not actor.get("verify", {}).get("ok", False):
             return jsonify({
@@ -1185,35 +1286,33 @@ def api_manual_in():
                 "actor_verify": actor.get("verify", {})
             }), 401
 
-        name = str(data.get("name", "")).strip()
-        size = str(data.get("size", "")).strip()
-        location = str(data.get("location", "")).strip()
-
-        try:
-            qty = int(data.get("qty", 0))
-        except Exception:
-            return jsonify({"ok": False, "message": "qty 格式錯誤"}), 400
+        data = request.get_json(silent=True) or {}
+        name = str(data.get("品名", "")).strip()
+        size = str(data.get("尺寸", "")).strip()
+        loc = str(data.get("位置", "")).strip()
+        qty = to_int(data.get("數量", 0))
 
         if not name:
-            return jsonify({"ok": False, "message": "請輸入品名"}), 400
+            return jsonify({"ok": False, "message": "品名不能空白"}), 400
         if not size:
-            return jsonify({"ok": False, "message": "請輸入尺寸"}), 400
+            return jsonify({"ok": False, "message": "尺寸不能空白"}), 400
+        if not loc:
+            return jsonify({"ok": False, "message": "位置不能空白"}), 400
         if qty <= 0:
             return jsonify({"ok": False, "message": "數量必須大於 0"}), 400
-        if not location:
-            return jsonify({"ok": False, "message": "請輸入位置"}), 400
 
         headers = get_headers()
         new_row = [""] * len(headers)
         new_row[get_col_index("品名") - 1] = name
         new_row[get_col_index("尺寸") - 1] = size
         new_row[get_col_index("數量") - 1] = qty
-        new_row[get_col_index("位置") - 1] = location
+        new_row[get_col_index("位置") - 1] = loc
 
         sheet = get_sheet()
         sheet.append_row(new_row)
+        clear_sheet_cache()
 
-        item = {"品名": name, "尺寸": size, "數量": qty, "位置": location}
+        item = {"品名": name, "尺寸": size, "數量": qty, "位置": loc}
 
         log_inventory_action_liff(
             "手動入庫",
@@ -1231,13 +1330,19 @@ def api_manual_in():
             "item": item,
             "actor_verify": actor.get("verify", {})
         })
+
     except Exception as e:
         return jsonify({"ok": False, "message": str(e)}), 500
+
+
+# =========================
+# Startup warmup
+# =========================
+start_background_warmup()
 
 
 # =========================
 # Main
 # =========================
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=PORT, debug=False)
