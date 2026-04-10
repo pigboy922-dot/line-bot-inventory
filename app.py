@@ -1,6 +1,7 @@
 import os
 import json
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from flask import Flask, request, abort, jsonify, render_template
 from flask_cors import CORS
@@ -58,6 +59,10 @@ user_temp_data = {}
 @app.route("/ping")
 def ping():
     return jsonify({"ok": True}), 200
+
+
+def tw_now_str():
+    return datetime.now(ZoneInfo("Asia/Taipei")).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def ensure_log_worksheet():
@@ -211,7 +216,7 @@ def get_chatroom_info(event):
 
 def log_inventory_action_line(event, action, item=None, old_qty="", change_qty="", new_qty="", note=""):
     chat = get_chatroom_info(event)
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now = tw_now_str()
     name = ""
     size = ""
     loc = ""
@@ -227,7 +232,7 @@ def log_inventory_action_line(event, action, item=None, old_qty="", change_qty="
 
 def log_inventory_action_liff(action, item=None, old_qty="", change_qty="", new_qty="", note="", actor=None):
     actor = actor or {}
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now = tw_now_str()
     name = ""
     size = ""
     loc = ""
