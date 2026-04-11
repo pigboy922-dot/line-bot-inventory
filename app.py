@@ -77,12 +77,11 @@ user_temp_data = {}
 # Stability Guards
 # =========================
 sheet_lock = threading.Lock()
-last_ping_ts = 0.0
-PING_MIN_INTERVAL = 20  # 秒，避免短時間被重複打爆
 
+# 限流桶
 request_buckets = {}
-REQUEST_LIMIT = 60      # 同 IP 每分鐘最多 60 次
-REQUEST_WINDOW = 60     # 秒
+REQUEST_LIMIT = 300      # 同一 key 每分鐘最多 300 次
+REQUEST_WINDOW = 60      # 秒
 
 
 def tw_now_str():
@@ -96,24 +95,51 @@ def get_client_ip():
     return request.remote_addr or "unknown"
 
 
+def get_rate_limit_key():
+    path = request.path
+    method = request.method.upper()
+
+    # ping / health 不限流，避免 cron 或健康檢查被誤傷
+    if path in ["/ping", "/health"]:
+        return None
+
+    # LIFF 優先用 token 區分
+    liff_token = request.headers.get("X-LIFF-ID-Token", "").strip()
+    if liff_token:
+        return f"liff:{liff_token[:32]}:{path}:{method}"
+
+    # 再用 line_user_id 區分
+    body = request.get_json(silent=True) or {}
+    line_user_id = str(body.get("line_user_id", "")).strip()
+    if line_user_id:
+        return f"user:{line_user_id}:{path}:{method}"
+
+    # 最後才回退到 IP
+    ip = get_client_ip()
+    return f"ip:{ip}:{path}:{method}"
+
+
 def simple_rate_limit(limit=REQUEST_LIMIT, window=REQUEST_WINDOW):
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
-            ip = get_client_ip()
-            now = time.time()
+            key = get_rate_limit_key()
+            if key is None:
+                return func(*args, **kwargs)
 
-            bucket = request_buckets.get(ip, [])
+            now = time.time()
+            bucket = request_buckets.get(key, [])
             bucket = [ts for ts in bucket if now - ts < window]
 
             if len(bucket) >= limit:
+                request_buckets[key] = bucket
                 return jsonify({
                     "ok": False,
                     "message": "請稍後再試"
                 }), 429
 
             bucket.append(now)
-            request_buckets[ip] = bucket
+            request_buckets[key] = bucket
             return func(*args, **kwargs)
         return wrapper
     return decorator
@@ -121,17 +147,6 @@ def simple_rate_limit(limit=REQUEST_LIMIT, window=REQUEST_WINDOW):
 
 @app.route("/ping", methods=["GET", "HEAD"])
 def ping():
-    global last_ping_ts
-    now = time.time()
-
-    if now - last_ping_ts < PING_MIN_INTERVAL:
-        return jsonify({
-            "ok": True,
-            "message": "pong",
-            "skipped": True
-        }), 200
-
-    last_ping_ts = now
     return jsonify({
         "ok": True,
         "message": "pong",
@@ -828,7 +843,6 @@ if handler:
 
 
 @app.get("/api/search")
-@simple_rate_limit()
 def api_search():
     missing = required_columns_ok()
     if missing:
@@ -843,7 +857,6 @@ def api_search():
 
 
 @app.get("/api/stock")
-@simple_rate_limit()
 def api_stock():
     missing = required_columns_ok()
     if missing:
