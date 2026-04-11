@@ -3,84 +3,85 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>塊材管理</title>
+<title>塊材管理 LIFF</title>
 
 <script src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
 
 <style>
-body {
-  font-family: sans-serif;
-  margin: 0;
-  padding: 10px;
-  background: #f5f5f5;
-}
-button {
-  padding: 10px;
-  margin: 5px;
-}
-.card {
-  background: #fff;
-  padding: 10px;
-  margin-bottom: 10px;
-  border-radius: 10px;
-}
+body { font-family: sans-serif; margin:0; background:#f5f7fb; }
+.app { max-width:700px; margin:auto; padding:10px; }
+.card { background:#fff; padding:12px; border-radius:12px; margin-bottom:10px; }
+.btn { padding:10px; border:none; border-radius:10px; cursor:pointer; }
+.btn-primary { background:#06c755; color:#fff; }
+.btn-secondary { background:#eee; }
+.input { width:100%; padding:10px; margin-bottom:10px; }
 </style>
 </head>
 
 <body>
+<div class="app">
 
 <h3>塊材管理</h3>
 
-<input id="keyword" placeholder="輸入品名或尺寸">
-<button onclick="search()">查詢</button>
+<div class="card">
+  <input id="keyword" class="input" placeholder="輸入品名或尺寸">
+  <button class="btn btn-primary" onclick="searchStock()">查詢</button>
+</div>
 
 <div id="result"></div>
 
-<hr>
+<div class="card">
+  <h4>手動入庫</h4>
+  <input id="manualName" class="input" placeholder="品名">
+  <input id="manualSize" class="input" placeholder="尺寸">
+  <input id="manualQty" class="input" placeholder="數量">
+  <input id="manualLoc" class="input" placeholder="位置">
+  <button class="btn btn-primary" onclick="submitManualIn()">送出</button>
+</div>
 
-<h4>手動入庫</h4>
-<input id="name" placeholder="品名">
-<input id="size" placeholder="尺寸">
-<input id="qty" placeholder="數量">
-<input id="loc" placeholder="位置">
-<button onclick="manualIn()">送出</button>
+</div>
 
 <script>
-const API = "https://line-bot-inventory-5487.onrender.com";
+const CONFIG = {
+  API_BASE: "https://line-bot-inventory-5487.onrender.com",
+  LIFF_ID: "2009630662-Qeb3Wh1t"
+};
 
-let isSubmitting = false;
-let profile = null;
+const state = {
+  profile: null,
+  isSubmitting: false,
+  lastSearchKeyword: ''
+};
 
-// =========================
-// 初始化 LIFF
-// =========================
+const el = {
+  result: document.getElementById("result"),
+  keyword: document.getElementById("keyword"),
+  manualName: document.getElementById("manualName"),
+  manualSize: document.getElementById("manualSize"),
+  manualQty: document.getElementById("manualQty"),
+  manualLoc: document.getElementById("manualLoc")
+};
+
+// ================= 初始化 =================
 async function init() {
-  try {
-    await liff.init({ liffId: "2009630662-Qeb3Wh1t" });
+  await liff.init({ liffId: CONFIG.LIFF_ID });
 
-    if (!liff.isLoggedIn()) {
-      liff.login();
-      return;
-    }
-
-    profile = await liff.getProfile();
-    console.log("登入成功", profile);
-  } catch (e) {
-    console.error(e);
+  if (!liff.isLoggedIn()) {
+    liff.login();
+    return;
   }
-}
 
+  state.profile = await liff.getProfile();
+}
 init();
 
-// =========================
-// 共用 API（加超時）
-// =========================
-async function callAPI(url, options = {}) {
+// ================= API =================
+async function api(url, options = {}) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 10000);
 
   try {
-    const res = await fetch(API + url, {
+    const res = await fetch(CONFIG.API_BASE + url, {
       ...options,
       headers: {
         "Content-Type": "application/json",
@@ -95,9 +96,10 @@ async function callAPI(url, options = {}) {
     if (!res.ok) throw new Error(data.message || "錯誤");
 
     return data;
+
   } catch (err) {
     if (err.name === "AbortError") {
-      throw new Error("伺服器回應超時");
+      throw new Error("伺服器逾時");
     }
     throw err;
   } finally {
@@ -105,155 +107,127 @@ async function callAPI(url, options = {}) {
   }
 }
 
-// =========================
-// 查詢
-// =========================
-async function search() {
-  if (isSubmitting) return;
-
-  const keyword = document.getElementById("keyword").value.trim();
-  if (!keyword) return alert("請輸入關鍵字");
-
-  isSubmitting = true;
+// ================= 查詢 =================
+async function searchStock() {
+  if (state.isSubmitting) return;
+  state.isSubmitting = true;
 
   try {
-    const data = await callAPI(`/api/search?q=${encodeURIComponent(keyword)}`);
+    const keyword = el.keyword.value.trim();
+    if (!keyword) return alert("請輸入關鍵字");
 
-    const list = data.items || [];
-    const div = document.getElementById("result");
-    div.innerHTML = "";
+    state.lastSearchKeyword = keyword;
 
-    if (!list.length) {
-      div.innerHTML = "找不到資料";
-      return;
+    const data = await api(`/api/search?q=${encodeURIComponent(keyword)}`);
+
+    render(data.items || []);
+
+  } catch (err) {
+    alert(err.message);
+  } finally {
+    state.isSubmitting = false;
+  }
+}
+
+// ================= 顯示 =================
+function render(list) {
+  el.result.innerHTML = "";
+
+  if (!list.length) {
+    el.result.innerHTML = "找不到資料";
+    return;
+  }
+
+  list.forEach(item => {
+    const div = document.createElement("div");
+    div.className = "card";
+
+    div.innerHTML = `
+      <b>${item.品名}</b><br>
+      尺寸:${item.尺寸}<br>
+      數量:${item.數量}<br>
+      位置:${item.位置}<br>
+      <input id="qty_${item.row_number}" placeholder="數量">
+      <button class="btn btn-primary" onclick="submitInOut('in', ${item.row_number})">入庫</button>
+      <button class="btn btn-secondary" onclick="submitInOut('out', ${item.row_number})">出庫</button>
+    `;
+
+    el.result.appendChild(div);
+  });
+}
+
+// ================= 入出庫 =================
+async function submitInOut(type, row) {
+  if (state.isSubmitting) return;
+  state.isSubmitting = true;
+
+  try {
+    const qty = document.getElementById("qty_" + row).value;
+
+    if (!qty || qty <= 0) throw new Error("數量錯誤");
+
+    const data = await api(
+      type === 'in' ? '/api/in' : '/api/out',
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          row_number: row,
+          qty: Number(qty),
+          line_user_id: state.profile?.userId || '',
+          line_name: state.profile?.displayName || ''
+        })
+      }
+    );
+
+    alert(data.message || "完成");
+
+    if (state.lastSearchKeyword) {
+      searchStock();
     }
 
-    list.forEach(item => {
-      const el = document.createElement("div");
-      el.className = "card";
-
-      el.innerHTML = `
-        <b>${item.品名}</b><br>
-        尺寸: ${item.尺寸}<br>
-        數量: ${item.數量}<br>
-        位置: ${item.位置}<br>
-        <input placeholder="數量" id="qty_${item.row_number}">
-        <button onclick="inStock(${item.row_number})">入庫</button>
-        <button onclick="outStock(${item.row_number})">出庫</button>
-      `;
-
-      div.appendChild(el);
-    });
-
-  } catch (e) {
-    alert(e.message);
+  } catch (err) {
+    alert(err.message);
   } finally {
-    isSubmitting = false;
+    state.isSubmitting = false;
   }
 }
 
-// =========================
-// 入庫
-// =========================
-async function inStock(row) {
-  if (isSubmitting) return;
-
-  const qty = document.getElementById("qty_" + row).value;
-
-  if (!qty || qty <= 0) return alert("數量錯誤");
-
-  isSubmitting = true;
+// ================= 手動入庫 =================
+async function submitManualIn() {
+  if (state.isSubmitting) return;
+  state.isSubmitting = true;
 
   try {
-    await callAPI("/api/in", {
-      method: "POST",
-      body: JSON.stringify({
-        row_number: row,
-        qty: Number(qty),
-        line_user_id: profile?.userId || "",
-        line_name: profile?.displayName || ""
-      })
+    const payload = {
+      name: el.manualName.value.trim(),
+      size: el.manualSize.value.trim(),
+      qty: Number(el.manualQty.value),
+      location: el.manualLoc.value.trim(),
+      line_user_id: state.profile?.userId || '',
+      line_name: state.profile?.displayName || ''
+    };
+
+    if (!payload.name) throw new Error("請輸入品名");
+    if (!payload.size) throw new Error("請輸入尺寸");
+    if (!payload.qty || payload.qty <= 0) throw new Error("數量錯誤");
+    if (!payload.location) throw new Error("請輸入位置");
+
+    const data = await api('/api/manual-in', {
+      method: 'POST',
+      body: JSON.stringify(payload)
     });
 
-    alert("入庫成功");
-    search();
+    alert(data.message || "成功");
 
-  } catch (e) {
-    alert(e.message);
+    el.manualName.value = "";
+    el.manualSize.value = "";
+    el.manualQty.value = "";
+    el.manualLoc.value = "";
+
+  } catch (err) {
+    alert(err.message);
   } finally {
-    isSubmitting = false;
-  }
-}
-
-// =========================
-// 出庫
-// =========================
-async function outStock(row) {
-  if (isSubmitting) return;
-
-  const qty = document.getElementById("qty_" + row).value;
-
-  if (!qty || qty <= 0) return alert("數量錯誤");
-
-  isSubmitting = true;
-
-  try {
-    await callAPI("/api/out", {
-      method: "POST",
-      body: JSON.stringify({
-        row_number: row,
-        qty: Number(qty),
-        line_user_id: profile?.userId || "",
-        line_name: profile?.displayName || ""
-      })
-    });
-
-    alert("出庫成功");
-    search();
-
-  } catch (e) {
-    alert(e.message);
-  } finally {
-    isSubmitting = false;
-  }
-}
-
-// =========================
-// 手動入庫
-// =========================
-async function manualIn() {
-  if (isSubmitting) return;
-
-  const name = document.getElementById("name").value.trim();
-  const size = document.getElementById("size").value.trim();
-  const qty = document.getElementById("qty").value.trim();
-  const loc = document.getElementById("loc").value.trim();
-
-  if (!name || !size || !qty || !loc) {
-    return alert("請填完整");
-  }
-
-  isSubmitting = true;
-
-  try {
-    await callAPI("/api/manual-in", {
-      method: "POST",
-      body: JSON.stringify({
-        name,
-        size,
-        qty: Number(qty),
-        location: loc,
-        line_user_id: profile?.userId || "",
-        line_name: profile?.displayName || ""
-      })
-    });
-
-    alert("新增成功");
-
-  } catch (e) {
-    alert(e.message);
-  } finally {
-    isSubmitting = false;
+    state.isSubmitting = false;
   }
 }
 </script>
