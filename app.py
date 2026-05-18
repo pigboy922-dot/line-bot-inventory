@@ -1,1046 +1,647 @@
-import os
 import json
-import time
-import threading
-from functools import wraps
-from datetime import datetime
-from zoneinfo import ZoneInfo
+import os
+import sqlite3
+from contextlib import closing
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
-from flask import Flask, request, abort, jsonify, render_template
+import requests
+from flask import Flask, jsonify, request, g, send_from_directory
 from flask_cors import CORS
 
-from linebot import LineBotApi, WebhookHandler
-from linebot.exceptions import InvalidSignatureError
-from linebot.models import (
-    MessageEvent, TextMessage, TextSendMessage,
-    TemplateSendMessage, ButtonsTemplate,
-    MessageTemplateAction, CarouselTemplate,
-    CarouselColumn, URIAction
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
+except Exception:
+    gspread = None
+    Credentials = None
+
+APP_TZ = timezone.utc
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.environ.get("DB_PATH", os.path.join(BASE_DIR, "results.db"))
+ESPN_TIMEOUT = float(os.environ.get("ESPN_TIMEOUT", "15"))
+PORT = int(os.environ.get("PORT", "8000"))
+DEBUG = os.environ.get("DEBUG", "0") == "1"
+MAX_RESULTS_DEFAULT = int(os.environ.get("MAX_RESULTS_DEFAULT", "5000"))
+
+# Google Sheets mirror.
+# Support both the new names and a few legacy aliases.
+GOOGLE_SHEETS_SPREADSHEET_ID = (
+    os.environ.get("GOOGLE_SHEETS_SPREADSHEET_ID", "").strip()
+    or os.environ.get("GOOGLE_SHEET_ID", "").strip()
+    or os.environ.get("SPREADSHEET_ID", "").strip()
 )
+GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+# Default fallback worksheet name. Normal writes use dynamic tabs like mlb_2026 / nba_2025.
+GOOGLE_SHEET_NAME = "results"
 
-import gspread
-from google.oauth2.service_account import Credentials
-from google.auth.transport import requests as google_requests
-from google.oauth2 import id_token as google_id_token
-
-
-# =========================
-# Flask
-# =========================
-app = Flask(__name__)
-CORS(app)
-
-# =========================
-# ENV
-# =========================
-LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
-LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
-GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "")
-GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "")
-LIFF_ID = os.getenv("LIFF_ID", "")
-PAGE_SIZE = 10
-
-if not GOOGLE_CREDENTIALS_JSON:
-    raise ValueError("缺少環境變數 GOOGLE_CREDENTIALS_JSON")
-if not GOOGLE_SHEET_ID:
-    raise ValueError("缺少環境變數 GOOGLE_SHEET_ID")
-
-# =========================
-# LINE
-# =========================
-line_bot_api = None
-handler = None
-if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
-    line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
-    handler = WebhookHandler(LINE_CHANNEL_SECRET)
-
-# =========================
-# Google Sheet
-# =========================
-scope = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive"
+PREFERRED_COLUMNS = [
+    "聯盟",
+    "比賽日期",
+    "對戰",
+    "客隊",
+    "主隊",
+    "最終比分",
+    "讓分盤",
+    "主客讓分盤",
+    "即時盤口",
+    "亞洲讓分盤",
+    "大小分盤",
+    "客隊近10場平均得分",
+    "客隊近10場平均失分",
+    "客隊近10場平均淨值",
+    "主隊近10場平均得分",
+    "主隊近10場平均失分",
+    "主隊近10場平均淨值",
+    "客隊近10得分-失分",
+    "主隊近10得分-失分",
+    "兩隊總和/2",
+    "近10型態",
+    "淨值和",
+    "讓分節奏差",
+    "淨值差",
+    "節奏差",
+    "節奏和",
+    "規則1讓分推薦",
+    "規則1讓分結果",
+    "規則2讓分推薦",
+    "規則2讓分結果",
+    "規則3讓分推薦",
+    "規則3讓分結果",
+    "規則3大小推薦",
+    "規則3大小結果",
+    "規則4大小推薦",
+    "規則4大小結果",
 ]
-creds_info = json.loads(GOOGLE_CREDENTIALS_JSON)
-credentials = Credentials.from_service_account_info(creds_info, scopes=scope)
-gc = gspread.authorize(credentials)
-spreadsheet = gc.open_by_key(GOOGLE_SHEET_ID)
-sheet = spreadsheet.sheet1
 
-# =========================
-# Runtime State
-# =========================
-user_states = {}
-user_temp_data = {}
+ESPN_SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/{sport}/{league}/scoreboard"
 
-# =========================
-# Stability Guards
-# =========================
-sheet_lock = threading.Lock()
+app = Flask(__name__)
+app.config["JSON_AS_ASCII"] = False
+CORS(app, resources={r"/*": {"origins": "*"}})
 
-# 限流桶
-request_buckets = {}
-REQUEST_LIMIT = 300      # 同一 key 每分鐘最多 300 次
-REQUEST_WINDOW = 60      # 秒
+@app.after_request
+def add_cors_headers(response):
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    return response
 
 
-def tw_now_str():
-    return datetime.now(ZoneInfo("Asia/Taipei")).strftime("%Y-%m-%d %H:%M:%S")
+def utc_now_iso() -> str:
+    return datetime.now(APP_TZ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def get_client_ip():
-    xff = request.headers.get("X-Forwarded-For", "")
-    if xff:
-        return xff.split(",")[0].strip()
-    return request.remote_addr or "unknown"
+def normalize_str(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
 
 
-def get_rate_limit_key():
-    path = request.path
-    method = request.method.upper()
+def normalize_int_str(value: Any) -> str:
+    return normalize_str(value)
 
-    # ping / health 不限流，避免 cron 或健康檢查被誤傷
-    if path in ["/ping", "/health"]:
+
+def get_db() -> sqlite3.Connection:
+    conn = getattr(g, "db", None)
+    if conn is None:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        g.db = conn
+    return conn
+
+
+@app.teardown_appcontext
+def close_db(exc: Optional[BaseException]) -> None:
+    conn = getattr(g, "db", None)
+    if conn is not None:
+        conn.close()
+        try:
+            delattr(g, "db")
+        except Exception:
+            pass
+
+
+def init_db() -> None:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                league TEXT NOT NULL,
+                season TEXT NOT NULL,
+                game_date TEXT NOT NULL,
+                game_id TEXT NOT NULL,
+                matchup TEXT DEFAULT '',
+                home_team TEXT DEFAULT '',
+                away_team TEXT DEFAULT '',
+                updated_time TEXT DEFAULT '',
+                raw_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(league, season, game_date, game_id)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_results_lookup ON results (league, season, game_date DESC, updated_at DESC)"
+        )
+        conn.commit()
+
+
+def canonicalize_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    data = dict(payload or {})
+    league = normalize_str(data.get("聯盟"))
+    season = normalize_int_str(data.get("賽季"))
+    game_date = normalize_str(data.get("比賽日期"))
+    game_id = normalize_str(data.get("比賽ID"))
+
+    if not league:
+        raise ValueError("缺少 聯盟")
+    if not season:
+        raise ValueError("缺少 賽季")
+    if not game_date:
+        raise ValueError("缺少 比賽日期")
+
+    if not game_id:
+        matchup = normalize_str(data.get("對戰"))
+        home = normalize_str(data.get("主隊"))
+        away = normalize_str(data.get("客隊"))
+        fallback = matchup or (away + "_vs_" + home)
+        game_id = f"{league}_{season}_{game_date}_{fallback}"
+        data["比賽ID"] = game_id
+
+    # 統一 NBA / MLB 回寫欄位口徑：對戰固定客隊-主隊。
+    away = normalize_str(data.get("客隊"))
+    home = normalize_str(data.get("主隊"))
+    if away and home:
+        data["對戰"] = f"{away}-{home}"
+
+    # NBA 沒有人工 1+50 / 1-50 / 2-50 選盤流程，但欄位需與 MLB 一致。
+    # 因此 NBA 的「亞洲讓分盤」自動同步數字讓分盤；MLB 則仍以人工選盤值為準。
+    if league.upper() == "NBA" and not normalize_str(data.get("亞洲讓分盤")) and normalize_str(data.get("讓分盤")):
+        data["亞洲讓分盤"] = data.get("讓分盤")
+
+    if not data.get("更新時間"):
+        data["更新時間"] = utc_now_iso()
+
+    return data
+
+
+def should_delete_mlb_row_without_asian(data: Dict[str, Any]) -> bool:
+    if normalize_str(data.get("聯盟")).upper() != "MLB":
+        return False
+    if normalize_str(data.get("亞洲讓分盤")):
+        return False
+    # 只有完賽或已準備判定時才刪；賽前推薦仍允許等待網頁人工選盤。
+    has_final = bool(normalize_str(data.get("最終比分")))
+    has_result = any(normalize_str(data.get(k)) for k in (
+        "規則1讓分結果", "規則2讓分結果", "規則3讓分結果",
+        "規則3大小結果", "規則4大小結果",
+    ))
+    return has_final or has_result or normalize_str(data.get("刪除原因")) == "MLB缺少亞洲讓分盤"
+
+def sheet_key_from_payload(payload: Dict[str, Any]) -> str:
+    return "|".join([
+        normalize_str(payload.get("聯盟")),
+        normalize_str(payload.get("比賽日期")),
+        normalize_str(payload.get("對戰")),
+    ])
+
+def maybe_delete_from_sheet(payload: Dict[str, Any]) -> Dict[str, Any]:
+    client = get_sheet_client()
+    if client is None:
+        return {"enabled": False, "reason": "google_sheets_not_configured_or_dependencies_missing", "action": "delete"}
+    sheet_name = get_dynamic_sheet_name(payload)
+    try:
+        ss = client.open_by_key(GOOGLE_SHEETS_SPREADSHEET_ID)
+        ws = get_or_create_worksheet(ss, sheet_name)
+        headers, row_index = worksheet_records_index(ws)
+        key = sheet_key_from_payload(payload)
+        row_num = row_index.get(key)
+        if row_num:
+            ws.delete_rows(row_num)
+            return {"enabled": True, "worksheet": sheet_name, "action": "delete", "row": row_num}
+        return {"enabled": True, "worksheet": sheet_name, "action": "delete", "row": None}
+    except Exception as exc:
+        return {"enabled": True, "worksheet": sheet_name, "action": "delete", "error": str(exc)}
+
+def delete_result_record(data: Dict[str, Any]) -> Dict[str, Any]:
+    db = get_db()
+    league = normalize_str(data["聯盟"])
+    season = normalize_int_str(data["賽季"])
+    game_date = normalize_str(data["比賽日期"])
+    game_id = normalize_str(data["比賽ID"])
+    db.execute(
+        "DELETE FROM results WHERE league = ? AND season = ? AND game_date = ? AND game_id = ?",
+        (league, season, game_date, game_id),
+    )
+    db.commit()
+    mirror_info = maybe_delete_from_sheet(data)
+    return {
+        "ok": True,
+        "league": league,
+        "season": season,
+        "game_date": game_date,
+        "game_id": game_id,
+        "action": "delete",
+        "reason": "MLB_missing_asian_handicap",
+        "sheet": mirror_info,
+    }
+
+
+def upsert_result(payload: Dict[str, Any]) -> Dict[str, Any]:
+    data = canonicalize_payload(payload)
+    db = get_db()
+    now = utc_now_iso()
+
+    league = normalize_str(data["聯盟"])
+    season = normalize_int_str(data["賽季"])
+    game_date = normalize_str(data["比賽日期"])
+    game_id = normalize_str(data["比賽ID"])
+    if not normalize_str(data.get("亞洲讓分盤")) and normalize_str(data.get("終盤")):
+        data["亞洲讓分盤"] = data.get("終盤")
+
+    existing_row = db.execute(
+        "SELECT raw_json FROM results WHERE league = ? AND season = ? AND game_date = ? AND game_id = ?",
+        (league, season, game_date, game_id),
+    ).fetchone()
+    if existing_row is not None:
+        try:
+            existing_data = json.loads(existing_row["raw_json"])
+        except Exception:
+            existing_data = {}
+        merged_data = dict(existing_data)
+        merged_data.update(data)
+        # 即時盤口只在第一次寫入時鎖定；之後回填比分 / 亞洲讓分盤時不得覆蓋。
+        if normalize_str(existing_data.get("即時盤口")):
+            merged_data["即時盤口"] = existing_data.get("即時盤口")
+        if normalize_str(existing_data.get("判定時間")):
+            merged_data["判定時間"] = existing_data.get("判定時間")
+        # 亞洲讓分盤由網頁人工選盤回寫；空值不得蓋掉既有亞洲讓分盤。
+        if normalize_str(existing_data.get("亞洲讓分盤")) and not normalize_str(data.get("亞洲讓分盤")):
+            merged_data["亞洲讓分盤"] = existing_data.get("亞洲讓分盤")
+        # 舊資料可能仍有「終盤」，僅作為亞洲讓分盤的相容來源，不再輸出到 Google Sheet 欄位。
+        if not normalize_str(merged_data.get("亞洲讓分盤")) and normalize_str(existing_data.get("終盤")):
+            merged_data["亞洲讓分盤"] = existing_data.get("終盤")
+        data = merged_data
+
+    if should_delete_mlb_row_without_asian(data):
+        return delete_result_record(data)
+
+    matchup = normalize_str(data.get("對戰"))
+    home_team = normalize_str(data.get("主隊"))
+    away_team = normalize_str(data.get("客隊"))
+    updated_time = normalize_str(data.get("更新時間"))
+    raw_json = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+
+    db.execute(
+        """
+        INSERT INTO results (
+            league, season, game_date, game_id, matchup, home_team, away_team,
+            updated_time, raw_json, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(league, season, game_date, game_id)
+        DO UPDATE SET
+            matchup=excluded.matchup,
+            home_team=excluded.home_team,
+            away_team=excluded.away_team,
+            updated_time=excluded.updated_time,
+            raw_json=excluded.raw_json,
+            updated_at=excluded.updated_at
+        """,
+        (
+            league, season, game_date, game_id, matchup, home_team, away_team,
+            updated_time, raw_json, now, now,
+        ),
+    )
+    db.commit()
+
+    mirror_info = maybe_mirror_to_sheet(data)
+    return {
+        "ok": True,
+        "league": league,
+        "season": season,
+        "game_date": game_date,
+        "game_id": game_id,
+        "sheet": mirror_info,
+    }
+
+
+def row_to_payload(row: sqlite3.Row) -> Dict[str, Any]:
+    try:
+        payload = json.loads(row["raw_json"])
+    except Exception:
+        payload = {}
+
+    payload.setdefault("聯盟", row["league"])
+    payload.setdefault("賽季", row["season"])
+    payload.setdefault("比賽日期", row["game_date"])
+    payload.setdefault("比賽ID", row["game_id"])
+    return payload
+
+
+def query_results(
+    league: Optional[str],
+    season: Optional[str],
+    limit: int,
+) -> List[Dict[str, Any]]:
+    db = get_db()
+    clauses: List[str] = []
+    params: List[Any] = []
+
+    if league:
+        clauses.append("league = ?")
+        params.append(league)
+    if season:
+        clauses.append("season = ?")
+        params.append(season)
+
+    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    sql = f"""
+        SELECT *
+        FROM results
+        {where_sql}
+        ORDER BY game_date DESC, updated_at DESC, id DESC
+        LIMIT ?
+    """
+    params.append(limit)
+    rows = db.execute(sql, params).fetchall()
+    return [row_to_payload(row) for row in rows]
+
+
+def compute_stats_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return rows
+
+
+def get_sheet_client():
+    if not GOOGLE_SHEETS_SPREADSHEET_ID or not GOOGLE_SERVICE_ACCOUNT_JSON:
+        return None
+    if gspread is None or Credentials is None:
         return None
 
-    # LIFF 優先用 token 區分
-    liff_token = request.headers.get("X-LIFF-ID-Token", "").strip()
-    if liff_token:
-        return f"liff:{liff_token[:32]}:{path}:{method}"
+    client = getattr(g, "sheet_client", None)
+    if client is not None:
+        return client
 
-    # 再用 line_user_id 區分
-    body = request.get_json(silent=True) or {}
-    line_user_id = str(body.get("line_user_id", "")).strip()
-    if line_user_id:
-        return f"user:{line_user_id}:{path}:{method}"
-
-    # 最後才回退到 IP
-    ip = get_client_ip()
-    return f"ip:{ip}:{path}:{method}"
-
-
-def simple_rate_limit(limit=REQUEST_LIMIT, window=REQUEST_WINDOW):
-    def decorator(func):
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            key = get_rate_limit_key()
-            if key is None:
-                return func(*args, **kwargs)
-
-            now = time.time()
-            bucket = request_buckets.get(key, [])
-            bucket = [ts for ts in bucket if now - ts < window]
-
-            if len(bucket) >= limit:
-                request_buckets[key] = bucket
-                return jsonify({
-                    "ok": False,
-                    "message": "請稍後再試"
-                }), 429
-
-            bucket.append(now)
-            request_buckets[key] = bucket
-            return func(*args, **kwargs)
-        return wrapper
-    return decorator
-
-
-@app.route("/ping", methods=["GET", "HEAD"])
-def ping():
-    return jsonify({
-        "ok": True,
-        "message": "pong",
-        "time": tw_now_str()
-    }), 200
-
-
-def ensure_log_worksheet():
-    headers = [
-        "時間", "聊天室類型", "群組名稱", "群組ID", "room_id", "user_key",
-        "動作", "品名", "尺寸", "原數量", "異動數量", "新數量", "位置", "備註"
+    info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
     ]
+    creds = Credentials.from_service_account_info(info, scopes=scopes)
+    client = gspread.authorize(creds)
+    g.sheet_client = client
+    return client
+
+
+def get_or_create_worksheet(spreadsheet, title: str):
     try:
-        ws = spreadsheet.worksheet("出入庫紀錄")
-        first_row = ws.row_values(1)
-        if not first_row:
-            ws.update("A1:N1", [headers])
-        return ws
+        return spreadsheet.worksheet(title)
     except Exception:
-        ws = spreadsheet.add_worksheet(title="出入庫紀錄", rows=2000, cols=14)
-        ws.update("A1:N1", [headers])
+        ws = spreadsheet.add_worksheet(
+            title=title,
+            rows=2000,
+            cols=len(PREFERRED_COLUMNS),
+        )
+        ws.append_row(PREFERRED_COLUMNS, value_input_option="USER_ENTERED")
         return ws
 
 
-log_sheet = ensure_log_worksheet()
+def build_sheet_headers(existing_headers: List[str], payload: Dict[str, Any]) -> List[str]:
+    # Google Sheet 僅回寫 PREFERRED_COLUMNS；payload 其他內部欄位不進表。
+    return list(PREFERRED_COLUMNS)
 
 
-def to_int(value):
-    try:
-        if value is None or value == "":
-            return 0
-        return int(float(str(value).strip()))
-    except Exception:
-        return 0
-
-
-def get_headers():
-    headers = sheet.row_values(1)
-    if not headers:
-        raise Exception("Google Sheet 第一列沒有表頭")
-    return headers
-
-
-def get_col_index(header_name):
-    headers = get_headers()
-    for i, h in enumerate(headers, start=1):
-        if str(h).strip() == header_name:
-            return i
-    raise Exception(f"找不到欄位：{header_name}")
-
-
-def required_columns_ok():
-    headers = [str(h).strip() for h in get_headers()]
-    required = ["品名", "尺寸", "數量", "位置"]
-    missing = [c for c in required if c not in headers]
-    return missing
-
-
-def find_matching_rows(keyword):
-    data = sheet.get_all_records()
-    keyword = str(keyword).strip().lower()
-    result = []
-    for idx, row in enumerate(data, start=2):
-        name = str(row.get("品名", "")).strip()
-        size = str(row.get("尺寸", "")).strip()
-        qty = row.get("數量", 0)
-        loc = str(row.get("位置", "")).strip()
-        if keyword in name.lower() or keyword in size.lower():
-            result.append({
-                "row_number": idx,
-                "品名": name,
-                "尺寸": size,
-                "數量": to_int(qty),
-                "位置": loc
-            })
+def col_to_a1(col_num: int) -> str:
+    result = ""
+    while col_num > 0:
+        col_num, rem = divmod(col_num - 1, 26)
+        result = chr(65 + rem) + result
     return result
 
 
-def get_item_by_row(row_number):
-    data = sheet.get_all_records()
-    for idx, row in enumerate(data, start=2):
-        if idx == row_number:
-            return {
-                "row_number": idx,
-                "品名": str(row.get("品名", "")).strip(),
-                "尺寸": str(row.get("尺寸", "")).strip(),
-                "數量": to_int(row.get("數量", 0)),
-                "位置": str(row.get("位置", "")).strip()
-            }
-    return None
+def force_preferred_headers(ws, existing_headers: Optional[List[str]] = None) -> List[str]:
+    headers = list(PREFERRED_COLUMNS)
+    end_col = col_to_a1(len(headers))
+    ws.update(f"A1:{end_col}1", [headers])
 
-
-def verify_liff_id_token(raw_token):
-    if not raw_token:
-        return {"ok": False, "message": "缺少 LIFF ID Token"}
-    if not LIFF_ID:
-        return {"ok": False, "message": "伺服器未設定 LIFF_ID"}
-    try:
-        payload = google_id_token.verify_oauth2_token(
-            raw_token,
-            google_requests.Request(),
-            audience=LIFF_ID
-        )
-        return {
-            "ok": True,
-            "sub": payload.get("sub", ""),
-            "name": payload.get("name", ""),
-            "picture": payload.get("picture", "")
-        }
-    except Exception as e:
-        return {"ok": False, "message": f"LIFF Token 驗證失敗：{str(e)}"}
-
-
-def get_actor_info():
-    token = request.headers.get("X-LIFF-ID-Token", "").strip()
-    verify = verify_liff_id_token(token) if token else {"ok": False}
-    body = request.get_json(silent=True) or {}
-    return {
-        "line_user_id": body.get("line_user_id", "") or verify.get("sub", ""),
-        "line_name": body.get("line_name", "") or verify.get("name", ""),
-        "verify": verify
-    }
-
-
-def get_user_key(event):
-    source = event.source
-    if source.type == "user":
-        return f"user:{source.user_id}"
-    if source.type == "group":
-        return f"group:{source.group_id}:user:{source.user_id}"
-    if source.type == "room":
-        return f"room:{source.room_id}:user:{source.user_id}"
-    return "unknown"
-
-
-def get_chatroom_info(event):
-    source = event.source
-    info = {
-        "聊天室類型": source.type,
-        "群組名稱": "",
-        "群組ID": "",
-        "room_id": "",
-        "user_key": get_user_key(event)
-    }
-    if source.type == "group":
-        info["群組ID"] = getattr(source, "group_id", "")
+    old_len = len(existing_headers or [])
+    if old_len > len(headers):
+        first_extra = len(headers) + 1
         try:
-            summary = line_bot_api.get_group_summary(source.group_id)
-            info["群組名稱"] = getattr(summary, "group_name", "") or ""
+            ws.delete_columns(first_extra, old_len)
         except Exception:
-            info["群組名稱"] = ""
-    elif source.type == "room":
-        info["room_id"] = getattr(source, "room_id", "")
-    return info
-
-
-def log_inventory_action_line(event, action, item=None, old_qty="", change_qty="", new_qty="", note=""):
-    chat = get_chatroom_info(event)
-    now = tw_now_str()
-    name = ""
-    size = ""
-    loc = ""
-    if item:
-        name = str(item.get("品名", "")).strip()
-        size = str(item.get("尺寸", "")).strip()
-        loc = str(item.get("位置", "")).strip()
-    log_sheet.append_row([
-        now, chat["聊天室類型"], chat["群組名稱"], chat["群組ID"], chat["room_id"],
-        chat["user_key"], action, name, size, old_qty, change_qty, new_qty, loc, note
-    ])
-
-
-def log_inventory_action_liff(action, item=None, old_qty="", change_qty="", new_qty="", note="", actor=None):
-    actor = actor or {}
-    now = tw_now_str()
-    name = ""
-    size = ""
-    loc = ""
-    if item:
-        name = str(item.get("品名", "")).strip()
-        size = str(item.get("尺寸", "")).strip()
-        loc = str(item.get("位置", "")).strip()
-    log_sheet.append_row([
-        now, "liff", "", "", "", actor.get("line_user_id", ""), action, name, size,
-        old_qty, change_qty, new_qty, loc, note or actor.get("line_name", "")
-    ])
-
-
-def reset_user_state(user_key):
-    user_states.pop(user_key, None)
-    user_temp_data.pop(user_key, None)
-
-
-def build_main_menu():
-    liff_url = f"https://liff.line.me/{LIFF_ID}" if LIFF_ID else "https://line-bot-inventory-5487.onrender.com/liff"
-    return TemplateSendMessage(
-        alt_text="塊材管理選單",
-        template=ButtonsTemplate(
-            title="塊材管理",
-            text="請選擇功能",
-            actions=[
-                MessageTemplateAction(label="查詢庫存", text="查詢庫存"),
-                MessageTemplateAction(label="全部庫存", text="全部庫存"),
-                URIAction(label="塊材查詢", uri=liff_url),
-                MessageTemplateAction(label="手動入庫", text="手動入庫"),
-            ]
-        )
-    )
-
-
-def build_liff_open_card():
-    liff_url = f"https://liff.line.me/{LIFF_ID}" if LIFF_ID else "https://line-bot-inventory-5487.onrender.com/liff"
-    return TemplateSendMessage(
-        alt_text="打開塊材查詢",
-        template=ButtonsTemplate(
-            title="塊材查詢",
-            text="點下面按鈕開啟 LIFF 庫存系統",
-            actions=[
-                URIAction(label="打開塊材查詢", uri=liff_url)
-            ]
-        )
-    )
-
-
-def build_search_results_carousel(items, mode="out"):
-    columns = []
-    for item in items[:10]:
-        title = f"{item['品名'][:20]}" or "查詢結果"
-        text = f"尺寸:{item['尺寸'][:20]}\n數量:{item['數量']}\n位置:{item['位置'][:20]}"
-        actions = []
-        if mode == "out":
-            actions.append(MessageTemplateAction(
-                label="直接出庫", text=f"直接出庫::{item['row_number']}"
-            ))
-        elif mode == "in":
-            actions.append(MessageTemplateAction(
-                label="直接入庫", text=f"直接入庫::{item['row_number']}"
-            ))
-        actions.append(MessageTemplateAction(label="返回選單", text="返回選單"))
-        columns.append(CarouselColumn(
-            title=title[:40],
-            text=text[:60],
-            actions=actions[:3]
-        ))
-    return TemplateSendMessage(
-        alt_text="查詢結果",
-        template=CarouselTemplate(columns=columns)
-    )
-
-
-def build_all_stock_carousel(page=1):
-    data = sheet.get_all_records()
-    total_count = len(data)
-    total_pages = max(1, (total_count + PAGE_SIZE - 1) // PAGE_SIZE)
-    page = max(1, min(page, total_pages))
-
-    start_idx = (page - 1) * PAGE_SIZE
-    end_idx = start_idx + PAGE_SIZE
-    rows = data[start_idx:end_idx]
-
-    columns = []
-    for idx, row in enumerate(rows, start=start_idx + 2):
-        name = str(row.get("品名", "")).strip()
-        size = str(row.get("尺寸", "")).strip()
-        qty = to_int(row.get("數量", 0))
-        loc = str(row.get("位置", "")).strip()
-
-        columns.append(CarouselColumn(
-            title=(name[:20] or "未命名"),
-            text=f"尺寸:{size[:20]}\n數量:{qty}\n位置:{loc[:20]}",
-            actions=[
-                MessageTemplateAction(label="直接出庫", text=f"直接出庫::{idx}"),
-                MessageTemplateAction(label="直接入庫", text=f"直接入庫::{idx}"),
-                MessageTemplateAction(label="返回選單", text="返回選單"),
-            ]
-        ))
-
-    messages = [
-        TextSendMessage(text=f"全部庫存　第 {page}/{total_pages} 頁，共 {total_count} 筆"),
-        TemplateSendMessage(
-            alt_text="全部庫存",
-            template=CarouselTemplate(columns=columns)
-        )
-    ]
-
-    nav_actions = []
-    if page > 1:
-        nav_actions.append(MessageTemplateAction(label="上一頁", text=f"全部庫存::{page-1}"))
-    if page < total_pages:
-        nav_actions.append(MessageTemplateAction(label="下一頁", text=f"全部庫存::{page+1}"))
-    nav_actions.append(MessageTemplateAction(label="返回選單", text="返回選單"))
-
-    messages.append(
-        TemplateSendMessage(
-            alt_text="分頁操作",
-            template=ButtonsTemplate(
-                title="分頁操作",
-                text="請選擇",
-                actions=nav_actions[:4]
-            )
-        )
-    )
-    return messages
-
-
-@app.route("/")
-def home():
-    return jsonify({
-        "ok": True,
-        "message": "LINE BOT + LIFF Inventory Running",
-        "line_bot_enabled": bool(line_bot_api and handler),
-        "liff_enabled": True
-    })
-
-
-@app.route("/health")
-def health():
-    try:
-        return jsonify({
-            "ok": True,
-            "message": "OK",
-            "sheet_id": GOOGLE_SHEET_ID,
-            "line_bot_enabled": bool(line_bot_api and handler),
-            "liff_id_configured": bool(LIFF_ID),
-            "time": tw_now_str()
-        })
-    except Exception as e:
-        return jsonify({"ok": False, "message": str(e)}), 500
-
-
-@app.route("/liff")
-def liff_page():
-    return render_template("liff_inventory_mobile_full.html")
-
-
-@app.route("/callback", methods=["POST"])
-def callback():
-    if not handler:
-        return jsonify({"ok": False, "message": "LINE BOT 未設定完成"}), 500
-
-    signature = request.headers.get("X-Line-Signature", "")
-    body = request.get_data(as_text=True)
-
-    try:
-        handler.handle(body, signature)
-    except InvalidSignatureError:
-        abort(400)
-
-    return "OK"
-
-
-if handler:
-    @handler.add(MessageEvent, message=TextMessage)
-    def handle_message(event):
-        user_key = get_user_key(event)
-        text = event.message.text.strip()
-        state = user_states.get(user_key, "")
-        missing = required_columns_ok()
-
-        if text == "塊材查詢":
-            reset_user_state(user_key)
-            line_bot_api.reply_message(event.reply_token, build_liff_open_card())
-            return
-
-        if missing:
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(text=f"Google Sheet 缺少欄位：{', '.join(missing)}")
-            )
-            return
-
-        if text == "取消":
-            reset_user_state(user_key)
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="已取消目前操作"))
-            return
-
-        if text == "返回選單":
-            reset_user_state(user_key)
-            line_bot_api.reply_message(event.reply_token, build_main_menu())
-            return
-
-        if text == "塊材管理":
-            reset_user_state(user_key)
-            line_bot_api.reply_message(event.reply_token, build_main_menu())
-            return
-
-        if text == "查詢庫存":
-            user_states[user_key] = "waiting_search_keyword"
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(text="請輸入品名或尺寸關鍵字，例如 KF-0030N 509 BDP-1，只要輸入 509 即可查詢")
-            )
-            return
-
-        if text == "入庫":
-            user_states[user_key] = "waiting_in_keyword"
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(text="請輸入要入庫的品名或尺寸關鍵字")
-            )
-            return
-
-        if text == "出庫":
-            user_states[user_key] = "waiting_out_keyword"
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(text="請輸入要出庫的品名或尺寸關鍵字")
-            )
-            return
-
-        if text == "手動入庫":
-            user_states[user_key] = "manual_in_name"
-            user_temp_data[user_key] = {}
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請輸入品名"))
-            return
-
-        if text == "全部庫存":
-            reset_user_state(user_key)
-            line_bot_api.reply_message(event.reply_token, build_all_stock_carousel(page=1))
-            return
-
-        if text.startswith("全部庫存::"):
             try:
-                page = int(text.split("::", 1)[1])
+                ws.batch_clear([f"{col_to_a1(first_extra)}1:{col_to_a1(old_len)}10000"])
             except Exception:
-                page = 1
-            reset_user_state(user_key)
-            line_bot_api.reply_message(event.reply_token, build_all_stock_carousel(page=page))
-            return
+                pass
+    return headers
 
-        if text.startswith("直接出庫::"):
-            try:
-                row_num = int(text.split("::", 1)[1])
-            except Exception:
-                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="列號格式錯誤"))
-                return
 
-            item = get_item_by_row(row_num)
-            if not item:
-                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="找不到該筆資料"))
-                return
+def worksheet_records_index(ws) -> Tuple[List[str], Dict[str, int]]:
+    values = ws.get_all_values()
+    existing_headers = values[0] if values else []
+    headers = force_preferred_headers(ws, existing_headers)
 
-            user_states[user_key] = "waiting_out_qty"
-            user_temp_data[user_key] = {"row_number": row_num, "item": item}
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(
-                    text=(
-                        f"請輸入出庫數量：\n"
-                        f"品名：{item['品名']}\n"
-                        f"尺寸：{item['尺寸']}\n"
-                        f"目前數量：{item['數量']}"
-                    )
-                )
-            )
-            return
+    index: Dict[str, int] = {}
+    league_idx = headers.index("聯盟")
+    date_idx = headers.index("比賽日期")
+    matchup_idx = headers.index("對戰")
 
-        if text.startswith("直接入庫::"):
-            try:
-                row_num = int(text.split("::", 1)[1])
-            except Exception:
-                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="列號格式錯誤"))
-                return
+    for row_num, row in enumerate(values[1:], start=2):
+        def cell(i: int) -> str:
+            return row[i] if i < len(row) else ""
 
-            item = get_item_by_row(row_num)
-            if not item:
-                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="找不到該筆資料"))
-                return
+        key = "|".join([
+            normalize_str(cell(league_idx)),
+            normalize_str(cell(date_idx)),
+            normalize_str(cell(matchup_idx)),
+        ])
+        if key.strip("|"):
+            index[key] = row_num
 
-            user_states[user_key] = "waiting_in_qty"
-            user_temp_data[user_key] = {"row_number": row_num, "item": item}
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(
-                    text=(
-                        f"請輸入入庫數量：\n"
-                        f"品名：{item['品名']}\n"
-                        f"尺寸：{item['尺寸']}\n"
-                        f"目前數量：{item['數量']}"
-                    )
-                )
-            )
-            return
+    return headers, index
 
-        if state == "waiting_search_keyword":
-            items = find_matching_rows(text)
-            reset_user_state(user_key)
-            if not items:
-                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="找不到符合的庫存資料"))
-                return
 
-            lines = []
-            for item in items[:20]:
-                lines.append(
-                    f"列號:{item['row_number']}｜品名:{item['品名']}｜尺寸:{item['尺寸']}｜數量:{item['數量']}｜位置:{item['位置']}"
-                )
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="\n".join(lines)))
-            return
+def get_dynamic_sheet_name(payload: Dict[str, Any]) -> str:
+    league = normalize_str(payload.get("聯盟")).lower()
+    season = normalize_str(payload.get("賽季"))
 
-        if state == "waiting_in_keyword":
-            items = find_matching_rows(text)
-            if not items:
-                reset_user_state(user_key)
-                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="找不到符合的庫存資料"))
-                return
+    if league in ("mlb", "nba") and season:
+        return f"{league}_{season}"
 
-            reset_user_state(user_key)
-            line_bot_api.reply_message(event.reply_token, build_search_results_carousel(items, mode="in"))
-            return
+    return GOOGLE_SHEET_NAME
 
-        if state == "waiting_out_keyword":
-            items = find_matching_rows(text)
-            if not items:
-                reset_user_state(user_key)
-                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="找不到符合的庫存資料"))
-                return
 
-            reset_user_state(user_key)
-            line_bot_api.reply_message(event.reply_token, build_search_results_carousel(items, mode="out"))
-            return
-
-        if state == "waiting_in_qty":
-            try:
-                add_qty = int(text)
-            except Exception:
-                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請輸入正整數"))
-                return
-
-            if add_qty <= 0:
-                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="入庫數量必須大於 0"))
-                return
-
-            temp = user_temp_data.get(user_key, {})
-            row_num = temp.get("row_number")
-            item = get_item_by_row(row_num)
-            if not item:
-                reset_user_state(user_key)
-                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="找不到該筆資料"))
-                return
-
-            with sheet_lock:
-                qty_col = get_col_index("數量")
-                old_qty = to_int(sheet.cell(row_num, qty_col).value)
-                new_qty = old_qty + add_qty
-                sheet.update_cell(row_num, qty_col, new_qty)
-
-            item["數量"] = new_qty
-
-            log_inventory_action_line(
-                event, "入庫", item=item, old_qty=old_qty, change_qty=add_qty, new_qty=new_qty, note="LINE BOT 入庫"
-            )
-
-            reset_user_state(user_key)
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(
-                    text=(
-                        f"入庫完成\n"
-                        f"品名：{item['品名']}\n"
-                        f"尺寸：{item['尺寸']}\n"
-                        f"原數量：{old_qty}\n"
-                        f"入庫：{add_qty}\n"
-                        f"新數量：{new_qty}"
-                    )
-                )
-            )
-            return
-
-        if state == "waiting_out_qty":
-            try:
-                out_qty = int(text)
-            except Exception:
-                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請輸入正整數"))
-                return
-
-            if out_qty <= 0:
-                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="出庫數量必須大於 0"))
-                return
-
-            temp = user_temp_data.get(user_key, {})
-            row_num = temp.get("row_number")
-            item = get_item_by_row(row_num)
-            if not item:
-                reset_user_state(user_key)
-                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="找不到該筆資料"))
-                return
-
-            with sheet_lock:
-                qty_col = get_col_index("數量")
-                old_qty = to_int(sheet.cell(row_num, qty_col).value)
-                if out_qty > old_qty:
-                    line_bot_api.reply_message(
-                        event.reply_token,
-                        TextSendMessage(text=f"目前庫存只有 {old_qty}，不能出庫 {out_qty}")
-                    )
-                    return
-
-                new_qty = old_qty - out_qty
-                sheet.update_cell(row_num, qty_col, new_qty)
-
-            item["數量"] = new_qty
-
-            log_inventory_action_line(
-                event, "出庫", item=item, old_qty=old_qty, change_qty=out_qty, new_qty=new_qty, note="LINE BOT 出庫"
-            )
-
-            reset_user_state(user_key)
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(
-                    text=(
-                        f"出庫完成\n"
-                        f"品名：{item['品名']}\n"
-                        f"尺寸：{item['尺寸']}\n"
-                        f"原數量：{old_qty}\n"
-                        f"出庫：{out_qty}\n"
-                        f"新數量：{new_qty}"
-                    )
-                )
-            )
-            return
-
-        if state == "manual_in_name":
-            user_temp_data[user_key]["品名"] = text
-            user_states[user_key] = "manual_in_size"
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請輸入尺寸"))
-            return
-
-        if state == "manual_in_size":
-            user_temp_data[user_key]["尺寸"] = text
-            user_states[user_key] = "manual_in_qty"
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請輸入數量"))
-            return
-
-        if state == "manual_in_qty":
-            try:
-                qty = int(text)
-            except Exception:
-                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請輸入正整數"))
-                return
-
-            if qty <= 0:
-                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="數量必須大於 0"))
-                return
-
-            user_temp_data[user_key]["數量"] = qty
-            user_states[user_key] = "manual_in_loc"
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請輸入位置"))
-            return
-
-        if state == "manual_in_loc":
-            temp = user_temp_data.get(user_key, {})
-            name = temp.get("品名", "").strip()
-            size = temp.get("尺寸", "").strip()
-            qty = temp.get("數量", 0)
-            loc = text.strip()
-
-            headers = get_headers()
-            new_row = [""] * len(headers)
-            new_row[get_col_index("品名") - 1] = name
-            new_row[get_col_index("尺寸") - 1] = size
-            new_row[get_col_index("數量") - 1] = qty
-            new_row[get_col_index("位置") - 1] = loc
-
-            with sheet_lock:
-                sheet.append_row(new_row)
-
-            item = {"品名": name, "尺寸": size, "數量": qty, "位置": loc}
-            log_inventory_action_line(
-                event, "手動入庫", item=item, old_qty=0, change_qty=qty, new_qty=qty, note="LINE BOT 手動入庫"
-            )
-
-            reset_user_state(user_key)
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(
-                    text=(
-                        f"手動入庫完成\n"
-                        f"品名：{name}\n"
-                        f"尺寸：{size}\n"
-                        f"數量：{qty}\n"
-                        f"位置：{loc}"
-                    )
-                )
-            )
-            return
-
-        allowed_idle_commands = {
-            "塊材管理", "塊材查詢", "查詢庫存", "入庫", "出庫",
-            "手動入庫", "全部庫存", "取消", "返回選單"
+def maybe_mirror_to_sheet(payload: Dict[str, Any]) -> Dict[str, Any]:
+    client = get_sheet_client()
+    if client is None:
+        return {
+            "enabled": False,
+            "reason": "google_sheets_not_configured_or_dependencies_missing",
         }
-        if text not in allowed_idle_commands:
-            return
 
-
-@app.get("/api/search")
-def api_search():
-    missing = required_columns_ok()
-    if missing:
-        return jsonify({"ok": False, "message": f"Sheet 缺少欄位：{', '.join(missing)}"}), 400
-
-    keyword = request.args.get("q", "").strip()
-    if not keyword:
-        return jsonify({"ok": True, "items": []})
-
-    items = find_matching_rows(keyword)
-    return jsonify({"ok": True, "items": items[:50]})
-
-
-@app.get("/api/stock")
-def api_stock():
-    missing = required_columns_ok()
-    if missing:
-        return jsonify({"ok": False, "message": f"Sheet 缺少欄位：{', '.join(missing)}"}), 400
+    sheet_name = get_dynamic_sheet_name(payload)
 
     try:
-        page = max(1, int(request.args.get("page", 1)))
-        page_size = max(1, int(request.args.get("page_size", PAGE_SIZE)))
-    except Exception:
-        return jsonify({"ok": False, "message": "page 或 page_size 格式錯誤"}), 400
+        ss = client.open_by_key(GOOGLE_SHEETS_SPREADSHEET_ID)
+        ws = get_or_create_worksheet(ss, sheet_name)
+        headers, row_index = worksheet_records_index(ws)
 
-    data = sheet.get_all_records()
-    total_count = len(data)
-    total_pages = max(1, (total_count + page_size - 1) // page_size)
-    page = min(page, total_pages)
+        row_values = [payload.get(h, "") for h in headers]
+        key = sheet_key_from_payload(payload)
 
-    start_idx = (page - 1) * page_size
-    end_idx = start_idx + page_size
-    rows = data[start_idx:end_idx]
+        if key in row_index:
+            row_num = row_index[key]
+            end_col = col_to_a1(len(headers))
+            ws.update(f"A{row_num}:{end_col}{row_num}", [row_values])
+            return {
+                "enabled": True,
+                "worksheet": sheet_name,
+                "action": "update",
+                "row": row_num,
+            }
 
-    items = []
-    for idx, row in enumerate(rows, start=start_idx + 2):
-        items.append({
-            "row_number": idx,
-            "品名": str(row.get("品名", "")).strip(),
-            "尺寸": str(row.get("尺寸", "")).strip(),
-            "數量": to_int(row.get("數量", 0)),
-            "位置": str(row.get("位置", "")).strip()
-        })
+        ws.append_row(row_values, value_input_option="USER_ENTERED")
+        return {
+            "enabled": True,
+            "worksheet": sheet_name,
+            "action": "append",
+        }
+    except Exception as exc:
+        return {
+            "enabled": True,
+            "worksheet": sheet_name,
+            "error": str(exc),
+        }
+def proxy_scoreboard(league: str, sport: str, dates: str):
+    if not league or not sport or not dates:
+        return jsonify({"ok": False, "error": "league, sport, dates are required"}), 400
 
-    return jsonify({
-        "ok": True,
-        "page": page,
-        "total_pages": total_pages,
-        "total_count": total_count,
-        "items": items
-    })
-
-
-@app.post("/api/in")
-@simple_rate_limit()
-def api_in():
-    missing = required_columns_ok()
-    if missing:
-        return jsonify({"ok": False, "message": f"Sheet 缺少欄位：{', '.join(missing)}"}), 400
-
-    data = request.get_json(silent=True) or {}
-    actor = get_actor_info()
-
-    try:
-        row_num = int(data.get("row_number", 0))
-        add_qty = int(data.get("qty", 0))
-    except Exception:
-        return jsonify({"ok": False, "message": "row_number 或 qty 格式錯誤"}), 400
-
-    if row_num < 2:
-        return jsonify({"ok": False, "message": "row_number 錯誤"}), 400
-    if add_qty <= 0:
-        return jsonify({"ok": False, "message": "入庫數量必須大於 0"}), 400
-
-    item = get_item_by_row(row_num)
-    if not item:
-        return jsonify({"ok": False, "message": "找不到該筆資料"}), 404
-
-    with sheet_lock:
-        qty_col = get_col_index("數量")
-        old_qty = to_int(sheet.cell(row_num, qty_col).value)
-        new_qty = old_qty + add_qty
-        sheet.update_cell(row_num, qty_col, new_qty)
-
-    item["數量"] = new_qty
-    log_inventory_action_liff(
-        "入庫", item=item, old_qty=old_qty, change_qty=add_qty, new_qty=new_qty, note="LIFF 入庫", actor=actor
+    url = ESPN_SCOREBOARD_URL.format(sport=sport, league=league)
+    resp = requests.get(
+        url,
+        params={"dates": dates},
+        timeout=ESPN_TIMEOUT,
+        headers={"User-Agent": "Mozilla/5.0"},
     )
+    resp.raise_for_status()
+    return jsonify(resp.json())
 
+
+@app.get("/")
+def root():
+    # Serve the dashboard HTML at the service root, so URLs like /?auto=0 open the app.
+    return send_from_directory(BASE_DIR, "index.html")
+
+
+@app.get("/api")
+def api_root():
     return jsonify({
         "ok": True,
-        "message": "入庫完成",
-        "item": item,
-        "old_qty": old_qty,
-        "change_qty": add_qty,
-        "new_qty": new_qty
+        "service": "nba-mlb-cloud",
+        "time": utc_now_iso(),
+        "endpoints": [
+            "/health",
+            "/save_result",
+            "/results",
+            "/stats",
+            "/proxy/scoreboard",
+            "/scoreboard",
+        ],
+        "google_sheet_enabled": bool(GOOGLE_SHEETS_SPREADSHEET_ID and GOOGLE_SERVICE_ACCOUNT_JSON),
+        "google_sheet_name": GOOGLE_SHEET_NAME,
+        "google_sheet_mode": "dynamic_by_league_season",
+        "google_sheet_examples": ["mlb_2026", "nba_2025"],
+        "google_sheet_columns": "unified_nba_mlb_away_home_asian_handicap",
     })
 
 
-@app.post("/api/out")
-@simple_rate_limit()
-def api_out():
-    missing = required_columns_ok()
-    if missing:
-        return jsonify({"ok": False, "message": f"Sheet 缺少欄位：{', '.join(missing)}"}), 400
+@app.get("/health")
+def health():
+    db = get_db()
+    db.execute("SELECT 1")
+    return jsonify({"ok": True, "time": utc_now_iso()})
 
-    data = request.get_json(silent=True) or {}
-    actor = get_actor_info()
+
+@app.post("/save_result")
+def save_result():
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"ok": False, "error": "JSON object required"}), 400
 
     try:
-        row_num = int(data.get("row_number", 0))
-        out_qty = int(data.get("qty", 0))
-    except Exception:
-        return jsonify({"ok": False, "message": "row_number 或 qty 格式錯誤"}), 400
-
-    if row_num < 2:
-        return jsonify({"ok": False, "message": "row_number 錯誤"}), 400
-    if out_qty <= 0:
-        return jsonify({"ok": False, "message": "出庫數量必須大於 0"}), 400
-
-    item = get_item_by_row(row_num)
-    if not item:
-        return jsonify({"ok": False, "message": "找不到該筆資料"}), 404
-
-    with sheet_lock:
-        qty_col = get_col_index("數量")
-        old_qty = to_int(sheet.cell(row_num, qty_col).value)
-        if out_qty > old_qty:
-            return jsonify({"ok": False, "message": f"目前庫存只有 {old_qty}，不能出庫 {out_qty}"}), 400
-
-        new_qty = old_qty - out_qty
-        sheet.update_cell(row_num, qty_col, new_qty)
-
-    item["數量"] = new_qty
-    log_inventory_action_liff(
-        "出庫", item=item, old_qty=old_qty, change_qty=out_qty, new_qty=new_qty, note="LIFF 出庫", actor=actor
-    )
-
-    return jsonify({
-        "ok": True,
-        "message": "出庫完成",
-        "item": item,
-        "old_qty": old_qty,
-        "change_qty": out_qty,
-        "new_qty": new_qty
-    })
+        result = upsert_result(payload)
+        return jsonify(result)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
 
 
-@app.post("/api/manual-in")
-@simple_rate_limit()
-def api_manual_in():
-    missing = required_columns_ok()
-    if missing:
-        return jsonify({"ok": False, "message": f"Sheet 缺少欄位：{', '.join(missing)}"}), 400
-
-    data = request.get_json(silent=True) or {}
-    actor = get_actor_info()
-
-    name = str(data.get("name", "")).strip()
-    size = str(data.get("size", "")).strip()
-    location = str(data.get("location", "")).strip()
+@app.get("/results")
+def results():
+    league = normalize_str(request.args.get("league")) or None
+    season = normalize_str(request.args.get("season")) or None
 
     try:
-        qty = int(data.get("qty", 0))
+        limit_num = max(1, min(int(request.args.get("limit", MAX_RESULTS_DEFAULT)), 20000))
     except Exception:
-        return jsonify({"ok": False, "message": "qty 格式錯誤"}), 400
+        limit_num = MAX_RESULTS_DEFAULT
 
-    if not name:
-        return jsonify({"ok": False, "message": "請輸入品名"}), 400
-    if not size:
-        return jsonify({"ok": False, "message": "請輸入尺寸"}), 400
-    if not location:
-        return jsonify({"ok": False, "message": "請輸入位置"}), 400
-    if qty <= 0:
-        return jsonify({"ok": False, "message": "數量必須大於 0"}), 400
+    rows = query_results(league, season, limit_num)
+    return jsonify({"ok": True, "count": len(rows), "rows": rows})
 
-    headers = get_headers()
-    new_row = [""] * len(headers)
-    new_row[get_col_index("品名") - 1] = name
-    new_row[get_col_index("尺寸") - 1] = size
-    new_row[get_col_index("數量") - 1] = qty
-    new_row[get_col_index("位置") - 1] = location
 
-    with sheet_lock:
-        sheet.append_row(new_row)
+@app.get("/stats")
+def stats():
+    league = normalize_str(request.args.get("league")) or None
+    season = normalize_str(request.args.get("season")) or None
 
-    item = {"品名": name, "尺寸": size, "數量": qty, "位置": location}
-    log_inventory_action_liff(
-        "手動入庫", item=item, old_qty=0, change_qty=qty, new_qty=qty, note="LIFF 手動入庫", actor=actor
-    )
+    try:
+        limit_num = max(1, min(int(request.args.get("limit", MAX_RESULTS_DEFAULT)), 20000))
+    except Exception:
+        limit_num = MAX_RESULTS_DEFAULT
 
-    return jsonify({
-        "ok": True,
-        "message": "手動入庫完成",
-        "item": item
-    })
+    rows = compute_stats_rows(query_results(league, season, limit_num))
+    return jsonify({"ok": True, "count": len(rows), "rows": rows})
+
+
+@app.get("/proxy/scoreboard")
+def proxy_scoreboard_route():
+    try:
+        return proxy_scoreboard(
+            normalize_str(request.args.get("league")),
+            normalize_str(request.args.get("sport")),
+            normalize_str(request.args.get("dates")),
+        )
+    except requests.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else 502
+        return jsonify({"ok": False, "error": f"ESPN HTTP {status}"}), status
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 502
+
+
+@app.get("/scoreboard")
+def scoreboard_route():
+    try:
+        return proxy_scoreboard(
+            normalize_str(request.args.get("league")),
+            normalize_str(request.args.get("sport")),
+            normalize_str(request.args.get("dates")),
+        )
+    except requests.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else 502
+        return jsonify({"ok": False, "error": f"ESPN HTTP {status}"}), status
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 502
 
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port)
+    init_db()
+    app.run(host="0.0.0.0", port=PORT, debug=DEBUG)
+else:
+    init_db()
