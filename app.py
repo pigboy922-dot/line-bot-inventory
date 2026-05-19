@@ -1,647 +1,399 @@
 import json
 import os
-import sqlite3
-from contextlib import closing
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime
+from typing import Dict, List, Optional
 
-import requests
-from flask import Flask, jsonify, request, g, send_from_directory
-from flask_cors import CORS
-
-try:
-    import gspread
-    from google.oauth2.service_account import Credentials
-except Exception:
-    gspread = None
-    Credentials = None
-
-APP_TZ = timezone.utc
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.environ.get("DB_PATH", os.path.join(BASE_DIR, "results.db"))
-ESPN_TIMEOUT = float(os.environ.get("ESPN_TIMEOUT", "15"))
-PORT = int(os.environ.get("PORT", "8000"))
-DEBUG = os.environ.get("DEBUG", "0") == "1"
-MAX_RESULTS_DEFAULT = int(os.environ.get("MAX_RESULTS_DEFAULT", "5000"))
-
-# Google Sheets mirror.
-# Support both the new names and a few legacy aliases.
-GOOGLE_SHEETS_SPREADSHEET_ID = (
-    os.environ.get("GOOGLE_SHEETS_SPREADSHEET_ID", "").strip()
-    or os.environ.get("GOOGLE_SHEET_ID", "").strip()
-    or os.environ.get("SPREADSHEET_ID", "").strip()
-)
-GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
-# Default fallback worksheet name. Normal writes use dynamic tabs like mlb_2026 / nba_2025.
-GOOGLE_SHEET_NAME = "results"
-
-PREFERRED_COLUMNS = [
-    "聯盟",
-    "比賽日期",
-    "對戰",
-    "客隊",
-    "主隊",
-    "最終比分",
-    "讓分盤",
-    "主客讓分盤",
-    "即時盤口",
-    "亞洲讓分盤",
-    "大小分盤",
-    "客隊近10場平均得分",
-    "客隊近10場平均失分",
-    "客隊近10場平均淨值",
-    "主隊近10場平均得分",
-    "主隊近10場平均失分",
-    "主隊近10場平均淨值",
-    "客隊近10得分-失分",
-    "主隊近10得分-失分",
-    "兩隊總和/2",
-    "近10型態",
-    "淨值和",
-    "讓分節奏差",
-    "淨值差",
-    "節奏差",
-    "節奏和",
-    "規則1讓分推薦",
-    "規則1讓分結果",
-    "規則2讓分推薦",
-    "規則2讓分結果",
-    "規則3讓分推薦",
-    "規則3讓分結果",
-    "規則3大小推薦",
-    "規則3大小結果",
-    "規則4大小推薦",
-    "規則4大小結果",
-]
-
-ESPN_SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/{sport}/{league}/scoreboard"
+import gspread
+from flask import Flask, abort, request
+from linebot import LineBotApi, WebhookHandler
+from linebot.exceptions import InvalidSignatureError
+from linebot.models import MessageEvent, TextMessage, TextSendMessage
+from oauth2client.service_account import ServiceAccountCredentials
 
 app = Flask(__name__)
-app.config["JSON_AS_ASCII"] = False
-CORS(app, resources={r"/*": {"origins": "*"}})
 
-@app.after_request
-def add_cors_headers(response):
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-    return response
+CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
+CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "")
+TIMEZONE = os.getenv("APP_TIMEZONE", "Asia/Taipei")
 
+if not CHANNEL_SECRET or not CHANNEL_ACCESS_TOKEN:
+    raise ValueError("請先設定 LINE_CHANNEL_SECRET 與 LINE_CHANNEL_ACCESS_TOKEN")
+if not GOOGLE_SERVICE_ACCOUNT_JSON or not GOOGLE_SHEET_ID:
+    raise ValueError("請先設定 GOOGLE_SERVICE_ACCOUNT_JSON 與 GOOGLE_SHEET_ID")
 
-def utc_now_iso() -> str:
-    return datetime.now(APP_TZ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
+handler = WebhookHandler(CHANNEL_SECRET)
 
+# 簡易對話狀態，適合單一雲端實例使用
+SESSIONS: Dict[str, dict] = {}
 
-def normalize_str(value: Any) -> str:
-    if value is None:
-        return ""
-    return str(value).strip()
-
-
-def normalize_int_str(value: Any) -> str:
-    return normalize_str(value)
+INVENTORY_HEADERS = ["品名", "尺寸", "庫存", "位置", "備註", "更新時間"]
+LOG_HEADERS = ["時間", "類型", "品名", "尺寸", "數量", "位置", "備註", "使用者"]
 
 
-def get_db() -> sqlite3.Connection:
-    conn = getattr(g, "db", None)
-    if conn is None:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        g.db = conn
-    return conn
+def now_str() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-@app.teardown_appcontext
-def close_db(exc: Optional[BaseException]) -> None:
-    conn = getattr(g, "db", None)
-    if conn is not None:
-        conn.close()
-        try:
-            delattr(g, "db")
-        except Exception:
-            pass
-
-
-def init_db() -> None:
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS results (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                league TEXT NOT NULL,
-                season TEXT NOT NULL,
-                game_date TEXT NOT NULL,
-                game_id TEXT NOT NULL,
-                matchup TEXT DEFAULT '',
-                home_team TEXT DEFAULT '',
-                away_team TEXT DEFAULT '',
-                updated_time TEXT DEFAULT '',
-                raw_json TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                UNIQUE(league, season, game_date, game_id)
-            )
-            """
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_results_lookup ON results (league, season, game_date DESC, updated_at DESC)"
-        )
-        conn.commit()
-
-
-def canonicalize_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    data = dict(payload or {})
-    league = normalize_str(data.get("聯盟"))
-    season = normalize_int_str(data.get("賽季"))
-    game_date = normalize_str(data.get("比賽日期"))
-    game_id = normalize_str(data.get("比賽ID"))
-
-    if not league:
-        raise ValueError("缺少 聯盟")
-    if not season:
-        raise ValueError("缺少 賽季")
-    if not game_date:
-        raise ValueError("缺少 比賽日期")
-
-    if not game_id:
-        matchup = normalize_str(data.get("對戰"))
-        home = normalize_str(data.get("主隊"))
-        away = normalize_str(data.get("客隊"))
-        fallback = matchup or (away + "_vs_" + home)
-        game_id = f"{league}_{season}_{game_date}_{fallback}"
-        data["比賽ID"] = game_id
-
-    # 統一 NBA / MLB 回寫欄位口徑：對戰固定客隊-主隊。
-    away = normalize_str(data.get("客隊"))
-    home = normalize_str(data.get("主隊"))
-    if away and home:
-        data["對戰"] = f"{away}-{home}"
-
-    # NBA 沒有人工 1+50 / 1-50 / 2-50 選盤流程，但欄位需與 MLB 一致。
-    # 因此 NBA 的「亞洲讓分盤」自動同步數字讓分盤；MLB 則仍以人工選盤值為準。
-    if league.upper() == "NBA" and not normalize_str(data.get("亞洲讓分盤")) and normalize_str(data.get("讓分盤")):
-        data["亞洲讓分盤"] = data.get("讓分盤")
-
-    if not data.get("更新時間"):
-        data["更新時間"] = utc_now_iso()
-
-    return data
-
-
-def should_delete_mlb_row_without_asian(data: Dict[str, Any]) -> bool:
-    if normalize_str(data.get("聯盟")).upper() != "MLB":
-        return False
-    if normalize_str(data.get("亞洲讓分盤")):
-        return False
-    # 只有完賽或已準備判定時才刪；賽前推薦仍允許等待網頁人工選盤。
-    has_final = bool(normalize_str(data.get("最終比分")))
-    has_result = any(normalize_str(data.get(k)) for k in (
-        "規則1讓分結果", "規則2讓分結果", "規則3讓分結果",
-        "規則3大小結果", "規則4大小結果",
-    ))
-    return has_final or has_result or normalize_str(data.get("刪除原因")) == "MLB缺少亞洲讓分盤"
-
-def sheet_key_from_payload(payload: Dict[str, Any]) -> str:
-    return "|".join([
-        normalize_str(payload.get("聯盟")),
-        normalize_str(payload.get("比賽日期")),
-        normalize_str(payload.get("對戰")),
-    ])
-
-def maybe_delete_from_sheet(payload: Dict[str, Any]) -> Dict[str, Any]:
-    client = get_sheet_client()
-    if client is None:
-        return {"enabled": False, "reason": "google_sheets_not_configured_or_dependencies_missing", "action": "delete"}
-    sheet_name = get_dynamic_sheet_name(payload)
-    try:
-        ss = client.open_by_key(GOOGLE_SHEETS_SPREADSHEET_ID)
-        ws = get_or_create_worksheet(ss, sheet_name)
-        headers, row_index = worksheet_records_index(ws)
-        key = sheet_key_from_payload(payload)
-        row_num = row_index.get(key)
-        if row_num:
-            ws.delete_rows(row_num)
-            return {"enabled": True, "worksheet": sheet_name, "action": "delete", "row": row_num}
-        return {"enabled": True, "worksheet": sheet_name, "action": "delete", "row": None}
-    except Exception as exc:
-        return {"enabled": True, "worksheet": sheet_name, "action": "delete", "error": str(exc)}
-
-def delete_result_record(data: Dict[str, Any]) -> Dict[str, Any]:
-    db = get_db()
-    league = normalize_str(data["聯盟"])
-    season = normalize_int_str(data["賽季"])
-    game_date = normalize_str(data["比賽日期"])
-    game_id = normalize_str(data["比賽ID"])
-    db.execute(
-        "DELETE FROM results WHERE league = ? AND season = ? AND game_date = ? AND game_id = ?",
-        (league, season, game_date, game_id),
-    )
-    db.commit()
-    mirror_info = maybe_delete_from_sheet(data)
-    return {
-        "ok": True,
-        "league": league,
-        "season": season,
-        "game_date": game_date,
-        "game_id": game_id,
-        "action": "delete",
-        "reason": "MLB_missing_asian_handicap",
-        "sheet": mirror_info,
-    }
-
-
-def upsert_result(payload: Dict[str, Any]) -> Dict[str, Any]:
-    data = canonicalize_payload(payload)
-    db = get_db()
-    now = utc_now_iso()
-
-    league = normalize_str(data["聯盟"])
-    season = normalize_int_str(data["賽季"])
-    game_date = normalize_str(data["比賽日期"])
-    game_id = normalize_str(data["比賽ID"])
-    if not normalize_str(data.get("亞洲讓分盤")) and normalize_str(data.get("終盤")):
-        data["亞洲讓分盤"] = data.get("終盤")
-
-    existing_row = db.execute(
-        "SELECT raw_json FROM results WHERE league = ? AND season = ? AND game_date = ? AND game_id = ?",
-        (league, season, game_date, game_id),
-    ).fetchone()
-    if existing_row is not None:
-        try:
-            existing_data = json.loads(existing_row["raw_json"])
-        except Exception:
-            existing_data = {}
-        merged_data = dict(existing_data)
-        merged_data.update(data)
-        # 即時盤口只在第一次寫入時鎖定；之後回填比分 / 亞洲讓分盤時不得覆蓋。
-        if normalize_str(existing_data.get("即時盤口")):
-            merged_data["即時盤口"] = existing_data.get("即時盤口")
-        if normalize_str(existing_data.get("判定時間")):
-            merged_data["判定時間"] = existing_data.get("判定時間")
-        # 亞洲讓分盤由網頁人工選盤回寫；空值不得蓋掉既有亞洲讓分盤。
-        if normalize_str(existing_data.get("亞洲讓分盤")) and not normalize_str(data.get("亞洲讓分盤")):
-            merged_data["亞洲讓分盤"] = existing_data.get("亞洲讓分盤")
-        # 舊資料可能仍有「終盤」，僅作為亞洲讓分盤的相容來源，不再輸出到 Google Sheet 欄位。
-        if not normalize_str(merged_data.get("亞洲讓分盤")) and normalize_str(existing_data.get("終盤")):
-            merged_data["亞洲讓分盤"] = existing_data.get("終盤")
-        data = merged_data
-
-    if should_delete_mlb_row_without_asian(data):
-        return delete_result_record(data)
-
-    matchup = normalize_str(data.get("對戰"))
-    home_team = normalize_str(data.get("主隊"))
-    away_team = normalize_str(data.get("客隊"))
-    updated_time = normalize_str(data.get("更新時間"))
-    raw_json = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
-
-    db.execute(
-        """
-        INSERT INTO results (
-            league, season, game_date, game_id, matchup, home_team, away_team,
-            updated_time, raw_json, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(league, season, game_date, game_id)
-        DO UPDATE SET
-            matchup=excluded.matchup,
-            home_team=excluded.home_team,
-            away_team=excluded.away_team,
-            updated_time=excluded.updated_time,
-            raw_json=excluded.raw_json,
-            updated_at=excluded.updated_at
-        """,
-        (
-            league, season, game_date, game_id, matchup, home_team, away_team,
-            updated_time, raw_json, now, now,
-        ),
-    )
-    db.commit()
-
-    mirror_info = maybe_mirror_to_sheet(data)
-    return {
-        "ok": True,
-        "league": league,
-        "season": season,
-        "game_date": game_date,
-        "game_id": game_id,
-        "sheet": mirror_info,
-    }
-
-
-def row_to_payload(row: sqlite3.Row) -> Dict[str, Any]:
-    try:
-        payload = json.loads(row["raw_json"])
-    except Exception:
-        payload = {}
-
-    payload.setdefault("聯盟", row["league"])
-    payload.setdefault("賽季", row["season"])
-    payload.setdefault("比賽日期", row["game_date"])
-    payload.setdefault("比賽ID", row["game_id"])
-    return payload
-
-
-def query_results(
-    league: Optional[str],
-    season: Optional[str],
-    limit: int,
-) -> List[Dict[str, Any]]:
-    db = get_db()
-    clauses: List[str] = []
-    params: List[Any] = []
-
-    if league:
-        clauses.append("league = ?")
-        params.append(league)
-    if season:
-        clauses.append("season = ?")
-        params.append(season)
-
-    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-    sql = f"""
-        SELECT *
-        FROM results
-        {where_sql}
-        ORDER BY game_date DESC, updated_at DESC, id DESC
-        LIMIT ?
-    """
-    params.append(limit)
-    rows = db.execute(sql, params).fetchall()
-    return [row_to_payload(row) for row in rows]
-
-
-def compute_stats_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    return rows
-
-
-def get_sheet_client():
-    if not GOOGLE_SHEETS_SPREADSHEET_ID or not GOOGLE_SERVICE_ACCOUNT_JSON:
-        return None
-    if gspread is None or Credentials is None:
-        return None
-
-    client = getattr(g, "sheet_client", None)
-    if client is not None:
-        return client
-
+def get_gc():
     info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
+    scope = [
+        "https://spreadsheets.google.com/feeds",
         "https://www.googleapis.com/auth/drive",
     ]
-    creds = Credentials.from_service_account_info(info, scopes=scopes)
-    client = gspread.authorize(creds)
-    g.sheet_client = client
-    return client
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(info, scope)
+    return gspread.authorize(creds)
 
 
-def get_or_create_worksheet(spreadsheet, title: str):
+def get_sheet(name: str, headers: List[str]):
+    gc = get_gc()
+    sh = gc.open_by_key(GOOGLE_SHEET_ID)
     try:
-        return spreadsheet.worksheet(title)
-    except Exception:
-        ws = spreadsheet.add_worksheet(
-            title=title,
-            rows=2000,
-            cols=len(PREFERRED_COLUMNS),
-        )
-        ws.append_row(PREFERRED_COLUMNS, value_input_option="USER_ENTERED")
-        return ws
+        ws = sh.worksheet(name)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=name, rows=1000, cols=max(10, len(headers) + 2))
+        ws.append_row(headers)
+    current_headers = ws.row_values(1)
+    if current_headers != headers:
+        ws.resize(rows=max(ws.row_count, 2), cols=max(ws.col_count, len(headers)))
+        ws.update("A1:{}1".format(chr(64 + len(headers))), [headers])
+    return ws
 
 
-def build_sheet_headers(existing_headers: List[str], payload: Dict[str, Any]) -> List[str]:
-    # Google Sheet 僅回寫 PREFERRED_COLUMNS；payload 其他內部欄位不進表。
-    return list(PREFERRED_COLUMNS)
+def inventory_ws():
+    return get_sheet("inventory", INVENTORY_HEADERS)
 
 
-def col_to_a1(col_num: int) -> str:
-    result = ""
-    while col_num > 0:
-        col_num, rem = divmod(col_num - 1, 26)
-        result = chr(65 + rem) + result
+def log_ws():
+    return get_sheet("transactions", LOG_HEADERS)
+
+
+def get_records() -> List[dict]:
+    ws = inventory_ws()
+    rows = ws.get_all_records(expected_headers=INVENTORY_HEADERS)
+    cleaned = []
+    for idx, row in enumerate(rows, start=2):
+        row["_row"] = idx
+        row["品名"] = str(row.get("品名", "")).strip()
+        row["尺寸"] = str(row.get("尺寸", "")).strip()
+        row["位置"] = str(row.get("位置", "")).strip()
+        row["備註"] = str(row.get("備註", "")).strip()
+        try:
+            row["庫存"] = int(float(row.get("庫存", 0) or 0))
+        except Exception:
+            row["庫存"] = 0
+        cleaned.append(row)
+    return cleaned
+
+
+def session_key(event) -> str:
+    source = event.source
+    return getattr(source, "user_id", None) or getattr(source, "group_id", None) or getattr(source, "room_id", None) or "default"
+
+
+def actor_name(event) -> str:
+    source = event.source
+    return getattr(source, "user_id", None) or getattr(source, "group_id", None) or "unknown"
+
+
+def normalize(s: str) -> str:
+    return (s or "").strip().lower()
+
+
+def search_inventory(keyword: str) -> List[dict]:
+    keyword_n = normalize(keyword)
+    result = []
+    for row in get_records():
+        text = f"{row['品名']} {row['尺寸']} {row['位置']} {row['備註']}".lower()
+        if keyword_n in text:
+            result.append(row)
     return result
 
 
-def force_preferred_headers(ws, existing_headers: Optional[List[str]] = None) -> List[str]:
-    headers = list(PREFERRED_COLUMNS)
-    end_col = col_to_a1(len(headers))
-    ws.update(f"A1:{end_col}1", [headers])
-
-    old_len = len(existing_headers or [])
-    if old_len > len(headers):
-        first_extra = len(headers) + 1
-        try:
-            ws.delete_columns(first_extra, old_len)
-        except Exception:
-            try:
-                ws.batch_clear([f"{col_to_a1(first_extra)}1:{col_to_a1(old_len)}10000"])
-            except Exception:
-                pass
-    return headers
+def distinct_items(rows: List[dict]) -> List[dict]:
+    seen = set()
+    items = []
+    for row in rows:
+        key = (row["品名"], row["尺寸"])
+        if key not in seen:
+            seen.add(key)
+            items.append(row)
+    return items
 
 
-def worksheet_records_index(ws) -> Tuple[List[str], Dict[str, int]]:
-    values = ws.get_all_values()
-    existing_headers = values[0] if values else []
-    headers = force_preferred_headers(ws, existing_headers)
-
-    index: Dict[str, int] = {}
-    league_idx = headers.index("聯盟")
-    date_idx = headers.index("比賽日期")
-    matchup_idx = headers.index("對戰")
-
-    for row_num, row in enumerate(values[1:], start=2):
-        def cell(i: int) -> str:
-            return row[i] if i < len(row) else ""
-
-        key = "|".join([
-            normalize_str(cell(league_idx)),
-            normalize_str(cell(date_idx)),
-            normalize_str(cell(matchup_idx)),
-        ])
-        if key.strip("|"):
-            index[key] = row_num
-
-    return headers, index
+def format_search_result(rows: List[dict], keyword: str) -> str:
+    if not rows:
+        return f"找不到包含【{keyword}】的資料。"
+    lines = [f"找到 {len(rows)} 筆【{keyword}】相關資料："]
+    for i, row in enumerate(rows[:15], start=1):
+        lines.append(
+            f"{i}. {row['品名']} / {row['尺寸']} / 庫存:{row['庫存']} / 位置:{row['位置'] or '-'}"
+        )
+    if len(rows) > 15:
+        lines.append(f"…其餘 {len(rows)-15} 筆未顯示")
+    return "\n".join(lines)
 
 
-def get_dynamic_sheet_name(payload: Dict[str, Any]) -> str:
-    league = normalize_str(payload.get("聯盟")).lower()
-    season = normalize_str(payload.get("賽季"))
-
-    if league in ("mlb", "nba") and season:
-        return f"{league}_{season}"
-
-    return GOOGLE_SHEET_NAME
+def set_session(key: str, data: dict):
+    SESSIONS[key] = data
 
 
-def maybe_mirror_to_sheet(payload: Dict[str, Any]) -> Dict[str, Any]:
-    client = get_sheet_client()
-    if client is None:
-        return {
-            "enabled": False,
-            "reason": "google_sheets_not_configured_or_dependencies_missing",
-        }
+def clear_session(key: str):
+    SESSIONS.pop(key, None)
 
-    sheet_name = get_dynamic_sheet_name(payload)
 
+def get_session(key: str) -> Optional[dict]:
+    return SESSIONS.get(key)
+
+
+def create_or_update_inventory(item_name: str, size: str, qty_delta: int, location: str, note: str):
+    ws = inventory_ws()
+    records = get_records()
+    match = None
+    for row in records:
+        if normalize(row["品名"]) == normalize(item_name) and normalize(row["尺寸"]) == normalize(size):
+            match = row
+            break
+
+    if match:
+        new_qty = match["庫存"] + qty_delta
+        if new_qty < 0:
+            raise ValueError(f"庫存不足，目前庫存 {match['庫存']}，無法出庫 {abs(qty_delta)}")
+        ws.update(
+            f"A{match['_row']}:F{match['_row']}",
+            [[item_name, size, new_qty, location or match["位置"], note or match["備註"], now_str()]],
+        )
+    else:
+        if qty_delta < 0:
+            raise ValueError("找不到此品項，無法直接出庫。")
+        ws.append_row([item_name, size, qty_delta, location, note, now_str()])
+
+
+def append_log(action: str, item_name: str, size: str, qty: int, location: str, note: str, actor: str):
+    ws = log_ws()
+    ws.append_row([now_str(), action, item_name, size, qty, location, note, actor])
+
+
+@app.route("/", methods=["GET"])
+def home():
+    return "LINE Google Sheet inventory bot is running."
+
+
+@app.route("/callback", methods=["POST"])
+def callback():
+    signature = request.headers.get("X-Line-Signature", "")
+    body = request.get_data(as_text=True)
+    app.logger.info("Request body: %s", body)
     try:
-        ss = client.open_by_key(GOOGLE_SHEETS_SPREADSHEET_ID)
-        ws = get_or_create_worksheet(ss, sheet_name)
-        headers, row_index = worksheet_records_index(ws)
+        handler.handle(body, signature)
+    except InvalidSignatureError:
+        abort(400)
+    return "OK"
 
-        row_values = [payload.get(h, "") for h in headers]
-        key = sheet_key_from_payload(payload)
 
-        if key in row_index:
-            row_num = row_index[key]
-            end_col = col_to_a1(len(headers))
-            ws.update(f"A{row_num}:{end_col}{row_num}", [row_values])
-            return {
-                "enabled": True,
-                "worksheet": sheet_name,
-                "action": "update",
-                "row": row_num,
-            }
+@handler.add(MessageEvent, message=TextMessage)
+def handle_message(event):
+    text = event.message.text.strip()
+    key = session_key(event)
+    sess = get_session(key)
 
-        ws.append_row(row_values, value_input_option="USER_ENTERED")
-        return {
-            "enabled": True,
-            "worksheet": sheet_name,
-            "action": "append",
-        }
-    except Exception as exc:
-        return {
-            "enabled": True,
-            "worksheet": sheet_name,
-            "error": str(exc),
-        }
-def proxy_scoreboard(league: str, sport: str, dates: str):
-    if not league or not sport or not dates:
-        return jsonify({"ok": False, "error": "league, sport, dates are required"}), 400
+    if text in ["取消", "結束", "exit"]:
+        clear_session(key)
+        reply(event, "已取消目前流程。")
+        return
 
-    url = ESPN_SCOREBOARD_URL.format(sport=sport, league=league)
-    resp = requests.get(
-        url,
-        params={"dates": dates},
-        timeout=ESPN_TIMEOUT,
-        headers={"User-Agent": "Mozilla/5.0"},
+    if sess:
+        handle_session_reply(event, sess, text)
+        return
+
+    if text.startswith("查詢"):
+        keyword = text.replace("查詢", "", 1).strip()
+        if not keyword:
+            reply(event, "請輸入：查詢 509")
+            return
+        rows = search_inventory(keyword)
+        reply(event, format_search_result(rows, keyword))
+        return
+
+    if text.startswith("入庫") or text.startswith("出庫"):
+        action = "入庫" if text.startswith("入庫") else "出庫"
+        keyword = text.replace(action, "", 1).strip()
+        if not keyword:
+            reply(event, f"請輸入：{action} 509")
+            return
+        matches = distinct_items(search_inventory(keyword))
+        if not matches:
+            set_session(key, {
+                "step": "new_item_name",
+                "action": action,
+                "keyword": keyword,
+                "item_name": keyword,
+                "size": "",
+                "location": "",
+                "note": "",
+                "qty": None,
+            })
+            reply(event, f"找不到【{keyword}】現有資料。\n請直接輸入品名，或直接送出同樣品名建立新資料。")
+            return
+        if len(matches) == 1:
+            row = matches[0]
+            set_session(key, {
+                "step": "size",
+                "action": action,
+                "keyword": keyword,
+                "item_name": row["品名"],
+                "size": row["尺寸"],
+                "location": row["位置"],
+                "note": row["備註"],
+                "qty": None,
+            })
+            reply(event, f"品名：{row['品名']}\n目前尺寸：{row['尺寸'] or '-'}\n請輸入尺寸（直接送出原尺寸也可以）")
+            return
+
+        set_session(key, {
+            "step": "choose_item",
+            "action": action,
+            "keyword": keyword,
+            "choices": matches,
+        })
+        lines = [f"找到 {len(matches)} 個符合【{keyword}】的品項，請回覆編號："]
+        for i, row in enumerate(matches[:15], start=1):
+            lines.append(f"{i}. {row['品名']} / {row['尺寸']} / 庫存:{row['庫存']}")
+        lines.append("例如輸入：1")
+        reply(event, "\n".join(lines))
+        return
+
+    help_text = (
+        "可用指令：\n"
+        "1. 查詢 509\n"
+        "2. 入庫 509\n"
+        "3. 出庫 509\n"
+        "4. 輸入 取消 可結束流程"
     )
-    resp.raise_for_status()
-    return jsonify(resp.json())
+    reply(event, help_text)
 
 
-@app.get("/")
-def root():
-    # Serve the dashboard HTML at the service root, so URLs like /?auto=0 open the app.
-    return send_from_directory(BASE_DIR, "index.html")
 
+def handle_session_reply(event, sess: dict, text: str):
+    key = session_key(event)
+    step = sess.get("step")
 
-@app.get("/api")
-def api_root():
-    return jsonify({
-        "ok": True,
-        "service": "nba-mlb-cloud",
-        "time": utc_now_iso(),
-        "endpoints": [
-            "/health",
-            "/save_result",
-            "/results",
-            "/stats",
-            "/proxy/scoreboard",
-            "/scoreboard",
-        ],
-        "google_sheet_enabled": bool(GOOGLE_SHEETS_SPREADSHEET_ID and GOOGLE_SERVICE_ACCOUNT_JSON),
-        "google_sheet_name": GOOGLE_SHEET_NAME,
-        "google_sheet_mode": "dynamic_by_league_season",
-        "google_sheet_examples": ["mlb_2026", "nba_2025"],
-        "google_sheet_columns": "unified_nba_mlb_away_home_asian_handicap",
-    })
+    if step == "choose_item":
+        try:
+            idx = int(text) - 1
+            row = sess["choices"][idx]
+        except Exception:
+            reply(event, "請輸入正確編號，例如 1")
+            return
+        sess.update({
+            "step": "size",
+            "item_name": row["品名"],
+            "size": row["尺寸"],
+            "location": row["位置"],
+            "note": row["備註"],
+            "qty": None,
+        })
+        set_session(key, sess)
+        reply(event, f"已選擇：{row['品名']}\n目前尺寸：{row['尺寸'] or '-'}\n請輸入尺寸")
+        return
 
+    if step == "new_item_name":
+        sess["item_name"] = text.strip()
+        sess["step"] = "size"
+        set_session(key, sess)
+        reply(event, "請輸入尺寸")
+        return
 
-@app.get("/health")
-def health():
-    db = get_db()
-    db.execute("SELECT 1")
-    return jsonify({"ok": True, "time": utc_now_iso()})
+    if step == "size":
+        sess["size"] = text.strip()
+        sess["step"] = "location"
+        set_session(key, sess)
+        reply(event, "請輸入位置（不知道可輸入 - ）")
+        return
 
+    if step == "location":
+        sess["location"] = text.strip()
+        sess["step"] = "note"
+        set_session(key, sess)
+        reply(event, "有無任何需要備註？沒有請輸入 -")
+        return
 
-@app.post("/save_result")
-def save_result():
-    payload = request.get_json(silent=True)
-    if not isinstance(payload, dict):
-        return jsonify({"ok": False, "error": "JSON object required"}), 400
+    if step == "note":
+        sess["note"] = text.strip()
+        sess["step"] = "qty"
+        set_session(key, sess)
+        reply(event, f"請輸入{sess['action']}數量")
+        return
 
-    try:
-        result = upsert_result(payload)
-        return jsonify(result)
-    except ValueError as exc:
-        return jsonify({"ok": False, "error": str(exc)}), 400
-    except Exception as exc:
-        return jsonify({"ok": False, "error": str(exc)}), 500
-
-
-@app.get("/results")
-def results():
-    league = normalize_str(request.args.get("league")) or None
-    season = normalize_str(request.args.get("season")) or None
-
-    try:
-        limit_num = max(1, min(int(request.args.get("limit", MAX_RESULTS_DEFAULT)), 20000))
-    except Exception:
-        limit_num = MAX_RESULTS_DEFAULT
-
-    rows = query_results(league, season, limit_num)
-    return jsonify({"ok": True, "count": len(rows), "rows": rows})
-
-
-@app.get("/stats")
-def stats():
-    league = normalize_str(request.args.get("league")) or None
-    season = normalize_str(request.args.get("season")) or None
-
-    try:
-        limit_num = max(1, min(int(request.args.get("limit", MAX_RESULTS_DEFAULT)), 20000))
-    except Exception:
-        limit_num = MAX_RESULTS_DEFAULT
-
-    rows = compute_stats_rows(query_results(league, season, limit_num))
-    return jsonify({"ok": True, "count": len(rows), "rows": rows})
-
-
-@app.get("/proxy/scoreboard")
-def proxy_scoreboard_route():
-    try:
-        return proxy_scoreboard(
-            normalize_str(request.args.get("league")),
-            normalize_str(request.args.get("sport")),
-            normalize_str(request.args.get("dates")),
+    if step == "qty":
+        try:
+            qty = int(text)
+            if qty <= 0:
+                raise ValueError
+        except Exception:
+            reply(event, "數量請輸入正整數，例如 5")
+            return
+        sess["qty"] = qty
+        sess["step"] = "confirm"
+        set_session(key, sess)
+        summary = (
+            f"請確認是否{sess['action']}：\n"
+            f"品名：{sess['item_name']}\n"
+            f"尺寸：{sess['size']}\n"
+            f"位置：{sess['location']}\n"
+            f"備註：{sess['note']}\n"
+            f"數量：{sess['qty']}\n\n"
+            f"確認請輸入：確認\n取消請輸入：取消"
         )
-    except requests.HTTPError as exc:
-        status = exc.response.status_code if exc.response is not None else 502
-        return jsonify({"ok": False, "error": f"ESPN HTTP {status}"}), status
-    except Exception as exc:
-        return jsonify({"ok": False, "error": str(exc)}), 502
+        reply(event, summary)
+        return
+
+    if step == "confirm":
+        if text != "確認":
+            reply(event, "請輸入【確認】完成，或輸入【取消】結束。")
+            return
+        action = sess["action"]
+        qty_delta = sess["qty"] if action == "入庫" else -sess["qty"]
+        try:
+            create_or_update_inventory(
+                sess["item_name"],
+                sess["size"],
+                qty_delta,
+                sess["location"],
+                sess["note"],
+            )
+            append_log(
+                action,
+                sess["item_name"],
+                sess["size"],
+                sess["qty"],
+                sess["location"],
+                sess["note"],
+                actor_name(event),
+            )
+        except Exception as e:
+            reply(event, f"處理失敗：{e}")
+            clear_session(key)
+            return
+
+        rows = search_inventory(sess["item_name"])
+        matched = None
+        for row in rows:
+            if normalize(row["品名"]) == normalize(sess["item_name"]) and normalize(row["尺寸"]) == normalize(sess["size"]):
+                matched = row
+                break
+        clear_session(key)
+        remain = matched["庫存"] if matched else "-"
+        reply(event, f"已完成{action}\n品名：{sess['item_name']}\n尺寸：{sess['size']}\n本次數量：{sess['qty']}\n目前庫存：{remain}")
+        return
 
 
-@app.get("/scoreboard")
-def scoreboard_route():
-    try:
-        return proxy_scoreboard(
-            normalize_str(request.args.get("league")),
-            normalize_str(request.args.get("sport")),
-            normalize_str(request.args.get("dates")),
-        )
-    except requests.HTTPError as exc:
-        status = exc.response.status_code if exc.response is not None else 502
-        return jsonify({"ok": False, "error": f"ESPN HTTP {status}"}), status
-    except Exception as exc:
-        return jsonify({"ok": False, "error": str(exc)}), 502
+def reply(event, text: str):
+    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=text[:4900]))
 
 
 if __name__ == "__main__":
-    init_db()
-    app.run(host="0.0.0.0", port=PORT, debug=DEBUG)
-else:
-    init_db()
+    port = int(os.getenv("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
