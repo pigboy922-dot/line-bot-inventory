@@ -12,7 +12,930 @@ from flask_cors import CORS
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import (
-    MessageEvent, TextMessage, TextSendMessage,
+    MessageEvent, TextMessage, TextSendMessage,import os
+import json
+import time
+import threading
+from functools import wraps
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+@@ -21,9 +24,15 @@
+from google.oauth2 import id_token as google_id_token
+
+
+# =========================
+# Flask
+# =========================
+app = Flask(__name__)
+CORS(app)
+
+# =========================
+# ENV
+# =========================
+LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
+GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "")
+@@ -36,12 +45,18 @@
+if not GOOGLE_SHEET_ID:
+raise ValueError("缺少環境變數 GOOGLE_SHEET_ID")
+
+# =========================
+# LINE
+# =========================
+line_bot_api = None
+handler = None
+if LINE_CHANNEL_SECRET and LINE_CHANNEL_ACCESS_TOKEN:
+line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
+handler = WebhookHandler(LINE_CHANNEL_SECRET)
+
+# =========================
+# Google Sheet
+# =========================
+scope = [
+"https://www.googleapis.com/auth/spreadsheets",
+"https://www.googleapis.com/auth/drive"
+@@ -52,19 +67,78 @@
+spreadsheet = gc.open_by_key(GOOGLE_SHEET_ID)
+sheet = spreadsheet.sheet1
+
+# =========================
+# Runtime State
+# =========================
+user_states = {}
+user_temp_data = {}
+
+# =========================
+# Stability Guards
+# =========================
+sheet_lock = threading.Lock()
+last_ping_ts = 0.0
+PING_MIN_INTERVAL = 20  # 秒，避免短時間被重複打爆
+
+@app.route("/ping")
+def ping():
+    return jsonify({"ok": True}), 200
+request_buckets = {}
+REQUEST_LIMIT = 60      # 同 IP 每分鐘最多 60 次
+REQUEST_WINDOW = 60     # 秒
+
+
+def tw_now_str():
+return datetime.now(ZoneInfo("Asia/Taipei")).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def get_client_ip():
+    xff = request.headers.get("X-Forwarded-For", "")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.remote_addr or "unknown"
+
+
+def simple_rate_limit(limit=REQUEST_LIMIT, window=REQUEST_WINDOW):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            ip = get_client_ip()
+            now = time.time()
+
+            bucket = request_buckets.get(ip, [])
+            bucket = [ts for ts in bucket if now - ts < window]
+
+            if len(bucket) >= limit:
+                return jsonify({
+                    "ok": False,
+                    "message": "請稍後再試"
+                }), 429
+
+            bucket.append(now)
+            request_buckets[ip] = bucket
+            return func(*args, **kwargs)
+        return wrapper
+    return decorator
+
+
+@app.route("/ping", methods=["GET", "HEAD"])
+def ping():
+    global last_ping_ts
+    now = time.time()
+
+    if now - last_ping_ts < PING_MIN_INTERVAL:
+        return jsonify({
+            "ok": True,
+            "message": "pong",
+            "skipped": True
+        }), 200
+
+    last_ping_ts = now
+    return jsonify({
+        "ok": True,
+        "message": "pong",
+        "time": tw_now_str()
+    }), 200
+
+
+def ensure_log_worksheet():
+headers = [
+"時間", "聊天室類型", "群組名稱", "群組ID", "room_id", "user_key",
+@@ -376,14 +450,13 @@ def home():
+@app.route("/health")
+def health():
+try:
+        missing = required_columns_ok()
+return jsonify({
+"ok": True,
+"message": "OK",
+"sheet_id": GOOGLE_SHEET_ID,
+            "missing_columns": missing,
+"line_bot_enabled": bool(line_bot_api and handler),
+            "liff_id_configured": bool(LIFF_ID)
+            "liff_id_configured": bool(LIFF_ID),
+            "time": tw_now_str()
+})
+except Exception as e:
+return jsonify({"ok": False, "message": str(e)}), 500
+@@ -410,344 +483,352 @@ def callback():
+return "OK"
+
+
+@handler.add(MessageEvent, message=TextMessage)
+def handle_message(event):
+    user_key = get_user_key(event)
+    text = event.message.text.strip()
+    state = user_states.get(user_key, "")
+    missing = required_columns_ok()
+
+    if text == "塊材查詢":
+        reset_user_state(user_key)
+        line_bot_api.reply_message(event.reply_token, build_liff_open_card())
+        return
+
+    if missing:
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=f"Google Sheet 缺少欄位：{', '.join(missing)}")
+        )
+        return
+
+    if text == "取消":
+        reset_user_state(user_key)
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="已取消目前操作"))
+        return
+
+    if text == "返回選單":
+        reset_user_state(user_key)
+        line_bot_api.reply_message(event.reply_token, build_main_menu())
+        return
+
+    if text == "塊材管理":
+        reset_user_state(user_key)
+        line_bot_api.reply_message(event.reply_token, build_main_menu())
+        return
+
+    if text == "查詢庫存":
+        user_states[user_key] = "waiting_search_keyword"
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text="請輸入品名或尺寸關鍵字，例如 KF-0030N 509 BDP-1，只要輸入 509 即可查詢")
+        )
+        return
+
+    if text == "入庫":
+        user_states[user_key] = "waiting_in_keyword"
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text="請輸入要入庫的品名或尺寸關鍵字")
+        )
+        return
+
+    if text == "出庫":
+        user_states[user_key] = "waiting_out_keyword"
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text="請輸入要出庫的品名或尺寸關鍵字")
+        )
+        return
+if handler:
+    @handler.add(MessageEvent, message=TextMessage)
+    def handle_message(event):
+        user_key = get_user_key(event)
+        text = event.message.text.strip()
+        state = user_states.get(user_key, "")
+        missing = required_columns_ok()
+
+    if text == "手動入庫":
+        user_states[user_key] = "manual_in_name"
+        user_temp_data[user_key] = {}
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請輸入品名"))
+        return
+        if text == "塊材查詢":
+            reset_user_state(user_key)
+            line_bot_api.reply_message(event.reply_token, build_liff_open_card())
+            return
+
+    if text == "全部庫存":
+        reset_user_state(user_key)
+        line_bot_api.reply_message(event.reply_token, build_all_stock_carousel(page=1))
+        return
+        if missing:
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text=f"Google Sheet 缺少欄位：{', '.join(missing)}")
+            )
+            return
+
+    if text.startswith("全部庫存::"):
+        try:
+            page = int(text.split("::", 1)[1])
+        except Exception:
+            page = 1
+        reset_user_state(user_key)
+        line_bot_api.reply_message(event.reply_token, build_all_stock_carousel(page=page))
+        return
+        if text == "取消":
+            reset_user_state(user_key)
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="已取消目前操作"))
+            return
+
+    if text.startswith("直接出庫::"):
+        try:
+            row_num = int(text.split("::", 1)[1])
+        except Exception:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="列號格式錯誤"))
+        if text == "返回選單":
+            reset_user_state(user_key)
+            line_bot_api.reply_message(event.reply_token, build_main_menu())
+return
+
+        item = get_item_by_row(row_num)
+        if not item:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="找不到該筆資料"))
+        if text == "塊材管理":
+            reset_user_state(user_key)
+            line_bot_api.reply_message(event.reply_token, build_main_menu())
+return
+
+        user_states[user_key] = "waiting_out_qty"
+        user_temp_data[user_key] = {"row_number": row_num, "item": item}
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(
+                text=(
+                    f"請輸入出庫數量：\n"
+                    f"品名：{item['品名']}\n"
+                    f"尺寸：{item['尺寸']}\n"
+                    f"目前數量：{item['數量']}"
+                )
+        if text == "查詢庫存":
+            user_states[user_key] = "waiting_search_keyword"
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text="請輸入品名或尺寸關鍵字，例如 KF-0030N 509 BDP-1，只要輸入 509 即可查詢")
+)
+        )
+        return
+
+    if text.startswith("直接入庫::"):
+        try:
+            row_num = int(text.split("::", 1)[1])
+        except Exception:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="列號格式錯誤"))
+return
+
+        item = get_item_by_row(row_num)
+        if not item:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="找不到該筆資料"))
+        if text == "入庫":
+            user_states[user_key] = "waiting_in_keyword"
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text="請輸入要入庫的品名或尺寸關鍵字")
+            )
+return
+
+        user_states[user_key] = "waiting_in_qty"
+        user_temp_data[user_key] = {"row_number": row_num, "item": item}
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(
+                text=(
+                    f"請輸入入庫數量：\n"
+                    f"品名：{item['品名']}\n"
+                    f"尺寸：{item['尺寸']}\n"
+                    f"目前數量：{item['數量']}"
+                )
+        if text == "出庫":
+            user_states[user_key] = "waiting_out_keyword"
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text="請輸入要出庫的品名或尺寸關鍵字")
+)
+        )
+        return
+
+    if state == "waiting_search_keyword":
+        items = find_matching_rows(text)
+        reset_user_state(user_key)
+        if not items:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="找不到符合的庫存資料"))
+return
+
+        lines = []
+        for item in items[:20]:
+            lines.append(
+                f"列號:{item['row_number']}｜品名:{item['品名']}｜尺寸:{item['尺寸']}｜數量:{item['數量']}｜位置:{item['位置']}"
+            )
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="\n".join(lines)))
+        return
+        if text == "手動入庫":
+            user_states[user_key] = "manual_in_name"
+            user_temp_data[user_key] = {}
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請輸入品名"))
+            return
+
+    if state == "waiting_in_keyword":
+        items = find_matching_rows(text)
+        if not items:
+        if text == "全部庫存":
+reset_user_state(user_key)
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="找不到符合資料，請重新輸入"))
+            line_bot_api.reply_message(event.reply_token, build_all_stock_carousel(page=1))
+return
+        user_states[user_key] = "waiting_in_select"
+        user_temp_data[user_key] = {"matched_items": items}
+        line_bot_api.reply_message(event.reply_token, build_search_results_carousel(items, mode="in"))
+        return
+
+    if state == "waiting_out_keyword":
+        items = find_matching_rows(text)
+        if not items:
+
+        if text.startswith("全部庫存::"):
+            try:
+                page = int(text.split("::", 1)[1])
+            except Exception:
+                page = 1
+reset_user_state(user_key)
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="找不到符合資料，請重新輸入"))
+            line_bot_api.reply_message(event.reply_token, build_all_stock_carousel(page=page))
+return
+        user_states[user_key] = "waiting_out_select"
+        user_temp_data[user_key] = {"matched_items": items}
+        line_bot_api.reply_message(event.reply_token, build_search_results_carousel(items, mode="out"))
+        return
+
+    if state == "waiting_in_qty":
+        try:
+            add_qty = int(text)
+        except Exception:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請輸入正整數"))
+            return
+        if text.startswith("直接出庫::"):
+            try:
+                row_num = int(text.split("::", 1)[1])
+            except Exception:
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="列號格式錯誤"))
+                return
+
+        if add_qty <= 0:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="入庫數量必須大於 0"))
+            return
+            item = get_item_by_row(row_num)
+            if not item:
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="找不到該筆資料"))
+                return
+
+        temp = user_temp_data.get(user_key, {})
+        row_num = temp.get("row_number")
+        item = get_item_by_row(row_num)
+        if not item:
+            reset_user_state(user_key)
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="找不到該筆資料"))
+            user_states[user_key] = "waiting_out_qty"
+            user_temp_data[user_key] = {"row_number": row_num, "item": item}
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(
+                    text=(
+                        f"請輸入出庫數量：\n"
+                        f"品名：{item['品名']}\n"
+                        f"尺寸：{item['尺寸']}\n"
+                        f"目前數量：{item['數量']}"
+                    )
+                )
+            )
+return
+
+        qty_col = get_col_index("數量")
+        old_qty = to_int(sheet.cell(row_num, qty_col).value)
+        new_qty = old_qty + add_qty
+        sheet.update_cell(row_num, qty_col, new_qty)
+        item["數量"] = new_qty
+        if text.startswith("直接入庫::"):
+            try:
+                row_num = int(text.split("::", 1)[1])
+            except Exception:
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="列號格式錯誤"))
+                return
+
+        log_inventory_action_line(
+            event, "入庫", item=item, old_qty=old_qty, change_qty=add_qty, new_qty=new_qty, note="LINE BOT 入庫"
+        )
+            item = get_item_by_row(row_num)
+            if not item:
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="找不到該筆資料"))
+                return
+
+        reset_user_state(user_key)
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(
+                text=(
+                    f"入庫完成\n"
+                    f"品名：{item['品名']}\n"
+                    f"尺寸：{item['尺寸']}\n"
+                    f"原數量：{old_qty}\n"
+                    f"入庫：{add_qty}\n"
+                    f"新數量：{new_qty}"
+            user_states[user_key] = "waiting_in_qty"
+            user_temp_data[user_key] = {"row_number": row_num, "item": item}
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(
+                    text=(
+                        f"請輸入入庫數量：\n"
+                        f"品名：{item['品名']}\n"
+                        f"尺寸：{item['尺寸']}\n"
+                        f"目前數量：{item['數量']}"
+                    )
+)
+)
+        )
+        return
+            return
+
+    if state == "waiting_out_qty":
+        try:
+            out_qty = int(text)
+        except Exception:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請輸入正整數"))
+        if state == "waiting_search_keyword":
+            items = find_matching_rows(text)
+            reset_user_state(user_key)
+            if not items:
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="找不到符合的庫存資料"))
+                return
+
+            lines = []
+            for item in items[:20]:
+                lines.append(
+                    f"列號:{item['row_number']}｜品名:{item['品名']}｜尺寸:{item['尺寸']}｜數量:{item['數量']}｜位置:{item['位置']}"
+                )
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="\n".join(lines)))
+return
+
+        if out_qty <= 0:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="出庫數量必須大於 0"))
+        if state == "waiting_in_keyword":
+            items = find_matching_rows(text)
+            if not items:
+                reset_user_state(user_key)
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="找不到符合的庫存資料"))
+                return
+
+            reset_user_state(user_key)
+            line_bot_api.reply_message(event.reply_token, build_search_results_carousel(items, mode="in"))
+return
+
+        temp = user_temp_data.get(user_key, {})
+        row_num = temp.get("row_number")
+        item = get_item_by_row(row_num)
+        if not item:
+        if state == "waiting_out_keyword":
+            items = find_matching_rows(text)
+            if not items:
+                reset_user_state(user_key)
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="找不到符合的庫存資料"))
+                return
+
+reset_user_state(user_key)
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="找不到該筆資料"))
+            line_bot_api.reply_message(event.reply_token, build_search_results_carousel(items, mode="out"))
+return
+
+        qty_col = get_col_index("數量")
+        old_qty = to_int(sheet.cell(row_num, qty_col).value)
+        if out_qty > old_qty:
+        if state == "waiting_in_qty":
+            try:
+                add_qty = int(text)
+            except Exception:
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請輸入正整數"))
+                return
+
+            if add_qty <= 0:
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="入庫數量必須大於 0"))
+                return
+
+            temp = user_temp_data.get(user_key, {})
+            row_num = temp.get("row_number")
+            item = get_item_by_row(row_num)
+            if not item:
+                reset_user_state(user_key)
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="找不到該筆資料"))
+                return
+
+            with sheet_lock:
+                qty_col = get_col_index("數量")
+                old_qty = to_int(sheet.cell(row_num, qty_col).value)
+                new_qty = old_qty + add_qty
+                sheet.update_cell(row_num, qty_col, new_qty)
+
+            item["數量"] = new_qty
+
+            log_inventory_action_line(
+                event, "入庫", item=item, old_qty=old_qty, change_qty=add_qty, new_qty=new_qty, note="LINE BOT 入庫"
+            )
+
+            reset_user_state(user_key)
+line_bot_api.reply_message(
+event.reply_token,
+                TextSendMessage(text=f"目前庫存只有 {old_qty}，不能出庫 {out_qty}")
+                TextSendMessage(
+                    text=(
+                        f"入庫完成\n"
+                        f"品名：{item['品名']}\n"
+                        f"尺寸：{item['尺寸']}\n"
+                        f"原數量：{old_qty}\n"
+                        f"入庫：{add_qty}\n"
+                        f"新數量：{new_qty}"
+                    )
+                )
+)
+return
+
+        new_qty = old_qty - out_qty
+        sheet.update_cell(row_num, qty_col, new_qty)
+        item["數量"] = new_qty
+
+        log_inventory_action_line(
+            event, "出庫", item=item, old_qty=old_qty, change_qty=out_qty, new_qty=new_qty, note="LINE BOT 出庫"
+        )
+        if state == "waiting_out_qty":
+            try:
+                out_qty = int(text)
+            except Exception:
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請輸入正整數"))
+                return
+
+            if out_qty <= 0:
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="出庫數量必須大於 0"))
+                return
+
+            temp = user_temp_data.get(user_key, {})
+            row_num = temp.get("row_number")
+            item = get_item_by_row(row_num)
+            if not item:
+                reset_user_state(user_key)
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="找不到該筆資料"))
+                return
+
+            with sheet_lock:
+                qty_col = get_col_index("數量")
+                old_qty = to_int(sheet.cell(row_num, qty_col).value)
+                if out_qty > old_qty:
+                    line_bot_api.reply_message(
+                        event.reply_token,
+                        TextSendMessage(text=f"目前庫存只有 {old_qty}，不能出庫 {out_qty}")
+                    )
+                    return
+
+                new_qty = old_qty - out_qty
+                sheet.update_cell(row_num, qty_col, new_qty)
+
+            item["數量"] = new_qty
+
+            log_inventory_action_line(
+                event, "出庫", item=item, old_qty=old_qty, change_qty=out_qty, new_qty=new_qty, note="LINE BOT 出庫"
+            )
+
+        reset_user_state(user_key)
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(
+                text=(
+                    f"出庫完成\n"
+                    f"品名：{item['品名']}\n"
+                    f"尺寸：{item['尺寸']}\n"
+                    f"原數量：{old_qty}\n"
+                    f"出庫：{out_qty}\n"
+                    f"新數量：{new_qty}"
+            reset_user_state(user_key)
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(
+                    text=(
+                        f"出庫完成\n"
+                        f"品名：{item['品名']}\n"
+                        f"尺寸：{item['尺寸']}\n"
+                        f"原數量：{old_qty}\n"
+                        f"出庫：{out_qty}\n"
+                        f"新數量：{new_qty}"
+                    )
+)
+)
+        )
+        return
+
+    if state == "manual_in_name":
+        user_temp_data[user_key]["品名"] = text
+        user_states[user_key] = "manual_in_size"
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請輸入尺寸"))
+        return
+
+    if state == "manual_in_size":
+        user_temp_data[user_key]["尺寸"] = text
+        user_states[user_key] = "manual_in_qty"
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請輸入數量"))
+        return
+            return
+
+    if state == "manual_in_qty":
+        try:
+            qty = int(text)
+        except Exception:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請輸入正整數"))
+        if state == "manual_in_name":
+            user_temp_data[user_key]["品名"] = text
+            user_states[user_key] = "manual_in_size"
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請輸入尺寸"))
+return
+
+        if qty <= 0:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="數量必須大於 0"))
+        if state == "manual_in_size":
+            user_temp_data[user_key]["尺寸"] = text
+            user_states[user_key] = "manual_in_qty"
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請輸入數量"))
+return
+
+        user_temp_data[user_key]["數量"] = qty
+        user_states[user_key] = "manual_in_loc"
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請輸入位置"))
+        return
+
+    if state == "manual_in_loc":
+        temp = user_temp_data.get(user_key, {})
+        name = temp.get("品名", "").strip()
+        size = temp.get("尺寸", "").strip()
+        qty = temp.get("數量", 0)
+        loc = text.strip()
+
+        headers = get_headers()
+        new_row = [""] * len(headers)
+        new_row[get_col_index("品名") - 1] = name
+        new_row[get_col_index("尺寸") - 1] = size
+        new_row[get_col_index("數量") - 1] = qty
+        new_row[get_col_index("位置") - 1] = loc
+        sheet.append_row(new_row)
+        if state == "manual_in_qty":
+            try:
+                qty = int(text)
+            except Exception:
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請輸入正整數"))
+                return
+
+        item = {"品名": name, "尺寸": size, "數量": qty, "位置": loc}
+        log_inventory_action_line(
+            event, "手動入庫", item=item, old_qty=0, change_qty=qty, new_qty=qty, note="LINE BOT 手動入庫"
+        )
+            if qty <= 0:
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="數量必須大於 0"))
+                return
+
+            user_temp_data[user_key]["數量"] = qty
+            user_states[user_key] = "manual_in_loc"
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請輸入位置"))
+            return
+
+        reset_user_state(user_key)
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(
+                text=(
+                    f"手動入庫完成\n"
+                    f"品名：{name}\n"
+                    f"尺寸：{size}\n"
+                    f"數量：{qty}\n"
+                    f"位置：{loc}"
+        if state == "manual_in_loc":
+            temp = user_temp_data.get(user_key, {})
+            name = temp.get("品名", "").strip()
+            size = temp.get("尺寸", "").strip()
+            qty = temp.get("數量", 0)
+            loc = text.strip()
+
+            headers = get_headers()
+            new_row = [""] * len(headers)
+            new_row[get_col_index("品名") - 1] = name
+            new_row[get_col_index("尺寸") - 1] = size
+            new_row[get_col_index("數量") - 1] = qty
+            new_row[get_col_index("位置") - 1] = loc
+
+            with sheet_lock:
+                sheet.append_row(new_row)
+
+            item = {"品名": name, "尺寸": size, "數量": qty, "位置": loc}
+            log_inventory_action_line(
+                event, "手動入庫", item=item, old_qty=0, change_qty=qty, new_qty=qty, note="LINE BOT 手動入庫"
+            )
+
+            reset_user_state(user_key)
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(
+                    text=(
+                        f"手動入庫完成\n"
+                        f"品名：{name}\n"
+                        f"尺寸：{size}\n"
+                        f"數量：{qty}\n"
+                        f"位置：{loc}"
+                    )
+)
+)
+        )
+        return
+            return
+
+    allowed_idle_commands = {
+        "塊材管理", "塊材查詢", "查詢庫存", "入庫", "出庫",
+        "手動入庫", "全部庫存", "取消", "返回選單"
+    }
+    if text not in allowed_idle_commands:
+        return
+        allowed_idle_commands = {
+            "塊材管理", "塊材查詢", "查詢庫存", "入庫", "出庫",
+            "手動入庫", "全部庫存", "取消", "返回選單"
+        }
+        if text not in allowed_idle_commands:
+            return
+
+
+@app.get("/api/search")
+@simple_rate_limit()
+def api_search():
+missing = required_columns_ok()
+if missing:
+@@ -762,6 +843,7 @@ def api_search():
+
+
+@app.get("/api/stock")
+@simple_rate_limit()
+def api_stock():
+missing = required_columns_ok()
+if missing:
+@@ -802,6 +884,7 @@ def api_stock():
+
+
+@app.post("/api/in")
+@simple_rate_limit()
+def api_in():
+missing = required_columns_ok()
+if missing:
+@@ -825,27 +908,29 @@ def api_in():
+if not item:
+return jsonify({"ok": False, "message": "找不到該筆資料"}), 404
+
+    qty_col = get_col_index("數量")
+    old_qty = to_int(sheet.cell(row_num, qty_col).value)
+    new_qty = old_qty + add_qty
+    sheet.update_cell(row_num, qty_col, new_qty)
+    item["數量"] = new_qty
+    with sheet_lock:
+        qty_col = get_col_index("數量")
+        old_qty = to_int(sheet.cell(row_num, qty_col).value)
+        new_qty = old_qty + add_qty
+        sheet.update_cell(row_num, qty_col, new_qty)
+
+    item["數量"] = new_qty
+log_inventory_action_liff(
+        "入庫", item=item, old_qty=old_qty, change_qty=add_qty, new_qty=new_qty,
+        note=f"LIFF入庫 / {actor.get('line_name', '')}", actor=actor
+        "入庫", item=item, old_qty=old_qty, change_qty=add_qty, new_qty=new_qty, note="LIFF 入庫", actor=actor
+)
+
+return jsonify({
+"ok": True,
+        "message": f"入庫完成，最新數量：{new_qty}",
+        "message": "入庫完成",
+        "item": item,
+"old_qty": old_qty,
+        "new_qty": new_qty,
+        "item": item
+        "change_qty": add_qty,
+        "new_qty": new_qty
+})
+
+
+@app.post("/api/out")
+@simple_rate_limit()
+def api_out():
+missing = required_columns_ok()
+if missing:
+@@ -869,30 +954,32 @@ def api_out():
+if not item:
+return jsonify({"ok": False, "message": "找不到該筆資料"}), 404
+
+    qty_col = get_col_index("數量")
+    old_qty = to_int(sheet.cell(row_num, qty_col).value)
+    if out_qty > old_qty:
+        return jsonify({"ok": False, "message": f"目前庫存只有 {old_qty}，不能出庫 {out_qty}"}), 400
+    with sheet_lock:
+        qty_col = get_col_index("數量")
+        old_qty = to_int(sheet.cell(row_num, qty_col).value)
+        if out_qty > old_qty:
+            return jsonify({"ok": False, "message": f"目前庫存只有 {old_qty}，不能出庫 {out_qty}"}), 400
+
+        new_qty = old_qty - out_qty
+        sheet.update_cell(row_num, qty_col, new_qty)
+
+    new_qty = old_qty - out_qty
+    sheet.update_cell(row_num, qty_col, new_qty)
+item["數量"] = new_qty
+
+log_inventory_action_liff(
+        "出庫", item=item, old_qty=old_qty, change_qty=out_qty, new_qty=new_qty,
+        note=f"LIFF出庫 / {actor.get('line_name', '')}", actor=actor
+        "出庫", item=item, old_qty=old_qty, change_qty=out_qty, new_qty=new_qty, note="LIFF 出庫", actor=actor
+)
+
+return jsonify({
+"ok": True,
+        "message": f"出庫完成，最新數量：{new_qty}",
+        "message": "出庫完成",
+        "item": item,
+"old_qty": old_qty,
+        "new_qty": new_qty,
+        "item": item
+        "change_qty": out_qty,
+        "new_qty": new_qty
+})
+
+
+@app.post("/api/manual-in")
+@simple_rate_limit()
+def api_manual_in():
+missing = required_columns_ok()
+if missing:
+@@ -904,6 +991,7 @@ def api_manual_in():
+name = str(data.get("name", "")).strip()
+size = str(data.get("size", "")).strip()
+location = str(data.get("location", "")).strip()
+
+try:
+qty = int(data.get("qty", 0))
+except Exception:
+@@ -913,28 +1001,33 @@ def api_manual_in():
+return jsonify({"ok": False, "message": "請輸入品名"}), 400
+if not size:
+return jsonify({"ok": False, "message": "請輸入尺寸"}), 400
+    if qty <= 0:
+        return jsonify({"ok": False, "message": "數量必須大於 0"}), 400
+if not location:
+return jsonify({"ok": False, "message": "請輸入位置"}), 400
+    if qty <= 0:
+        return jsonify({"ok": False, "message": "數量必須大於 0"}), 400
+
+headers = get_headers()
+new_row = [""] * len(headers)
+new_row[get_col_index("品名") - 1] = name
+new_row[get_col_index("尺寸") - 1] = size
+new_row[get_col_index("數量") - 1] = qty
+new_row[get_col_index("位置") - 1] = location
+    sheet.append_row(new_row)
+
+    with sheet_lock:
+        sheet.append_row(new_row)
+
+item = {"品名": name, "尺寸": size, "數量": qty, "位置": location}
+log_inventory_action_liff(
+        "手動入庫", item=item, old_qty=0, change_qty=qty, new_qty=qty,
+        note=f"LIFF手動入庫 / {actor.get('line_name', '')}", actor=actor
+        "手動入庫", item=item, old_qty=0, change_qty=qty, new_qty=qty, note="LIFF 手動入庫", actor=actor
+)
+
+    return jsonify({"ok": True, "message": "手動入庫完成", "item": item})
+    return jsonify({
+        "ok": True,
+        "message": "手動入庫完成",
+        "item": item
+    })
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    port = int(os.getenv("PORT", "5000"))
+app.run(host="0.0.0.0", port=port)
     TemplateSendMessage, ButtonsTemplate,
     MessageTemplateAction, CarouselTemplate,
     CarouselColumn, URIAction
