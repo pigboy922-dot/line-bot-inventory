@@ -186,7 +186,7 @@
       <label class="league-toggle"><input type="checkbox" id="mlbToggle" checked> MLB</label>
       <button class="btn-primary" id="todayBtn">更新今天</button>
       <button class="btn-secondary" id="tomorrowBtn">更新明天</button>
-      <div class="window-note" id="windowNote">目前顯示：NBA 原規則重抓區間版（R1讓分淨值差-1.4～8.4｜R2讓分方淨值0.1～2.8｜R3讓分盤2.5～15.5｜R4讓分方節奏差-8.5～29.0｜R5淨值和-2.1～9.4）；MLB 全打版（R1連敗5版：讓分方節奏8.1～11.8｜R2節奏差-0.5～4.5｜R3只保留客隊受讓｜符合就全出，不做每日最多2限制）；雙重賽第二場起不判斷；MLB亞洲盤口每天自動匯入 Playsport；符合推薦會自動出現在右上推薦總欄</div>
+      <div class="window-note" id="windowNote">目前顯示：NBA 原規則重抓區間版（R1讓分淨值差-1.4～8.4｜R2讓分方淨值0.1～2.8｜R3讓分盤2.5～15.5｜R4讓分方節奏差-8.5～29.0｜R5淨值和-2.1～9.4）；MLB 全打版（R1：1-50受讓｜讓分方節奏8.1～11.8＋排除受讓方淨值-1～0；R2全新版：1+50讓分｜淨值差1.0～2.5＋讓分方節奏7.5～12.0＋大小7.0～10.0；R3風控版：1-50受讓｜淨值和<4.5＋排除受讓方節奏10.1～11.5；符合就全出）；雙重賽第二場起不判斷；MLB亞洲盤口每天自動匯入 Playsport；符合推薦會自動出現在右上推薦總欄</div>
       <div class="status muted" id="status">尚未更新</div>
       <div class="status muted" id="cloudStatus">雲端寫入：待命</div>
       <div class="status muted" id="playsportStatus">Playsport盤口：待命</div>
@@ -441,21 +441,31 @@ function calcMlbPicksByManualAsianSelection(payload, asianLine) {
   let rule2 = 'PASS';
   let rule3 = 'PASS';
 
+  // MLB R1 869風控版：一正一負 + 1-50% + 買受讓方；讓分方節奏 8.1~11.8，排除受讓方淨值 -1~0。
+  const r1FavoritePaceOk = favoritePace !== null && favoritePace >= 8.1 && favoritePace <= 11.8;
+  const r1UnderdogNetOk = !(underdogNet !== null && underdogNet >= -1.0 && underdogNet < 0);
   if (
     near10Pattern === '一正一負' && isMlbAsianLineValidForRule('rule1', asianLine) &&
-    favoritePace !== null && Number.isFinite(Number(favoritePace)) && Number(favoritePace) >= 8.1 && Number(favoritePace) <= 11.8
+    r1FavoritePaceOk && r1UnderdogNetOk
   ) {
     rule1 = underdogName + ' 受讓';
   }
+
+  // MLB R2 全新版 B：一正一負 + 1+50% + 買讓分方；淨值差 1.0~2.5、讓分方節奏 7.5~12.0、大小分 7.0~10.0。
   if (
     near10Pattern === '一正一負' && isMlbAsianLineValidForRule('rule2', asianLine) &&
-    favoritePaceDiff !== null && favoritePaceDiff >= -0.5 && favoritePaceDiff <= 4.5
+    favoriteNetDiff !== null && favoriteNetDiff >= 1.0 && favoriteNetDiff <= 2.5 &&
+    favoritePace !== null && favoritePace >= 7.5 && favoritePace <= 12.0 &&
+    totalLine !== null && totalLine >= 7.0 && totalLine <= 10.0
   ) {
     rule2 = favoriteName + ' 讓分';
   }
+
+  // MLB R3 風控版：雙正分 + 1-50% + 買受讓方；淨值和 < 4.5，排除受讓方節奏 10.1~11.5。
   if (
     near10Pattern === '雙正分' && isMlbAsianLineValidForRule('rule3', asianLine) &&
-    info.side === 'home'
+    netSum !== null && netSum < 4.5 &&
+    !(underdogPace !== null && underdogPace >= 10.1 && underdogPace <= 11.5)
   ) {
     rule3 = underdogName + ' 受讓';
   }
@@ -2442,10 +2452,11 @@ function buildMlbHighProfitRulePicks(left, right, market) {
     let r2 = 'PASS';
     let r3 = 'PASS';
 
-    // 規則1：一正一負｜1-50｜買受讓方｜連敗5版：讓分方節奏 8.1~11.8。
+    // 規則1：一正一負｜1-50｜買受讓方｜風控版：讓分方節奏 8.1~11.8，排除受讓方淨值 -1~0。
     if (
       near10Pattern === '一正一負' &&
-      favoritePace !== null && Number.isFinite(Number(favoritePace)) && Number(favoritePace) >= 8.1 && Number(favoritePace) <= 11.8
+      favoritePace !== null && Number.isFinite(Number(favoritePace)) && Number(favoritePace) >= 8.1 && Number(favoritePace) <= 11.8 &&
+      !(underdogNet !== null && Number.isFinite(Number(underdogNet)) && Number(underdogNet) >= -1.0 && Number(underdogNet) < 0)
     ) {
       r1 = underdogName + ' 受讓';
     }
@@ -2930,7 +2941,7 @@ setInterval(() => {
 }, 60000);
 
 
-<!-- MLB 全打版：R1 連敗5版（讓分方節奏 8.1~11.8）；R2 節奏差 -0.5~4.5；R3 只保留客隊受讓；不做每日最多2限制，符合規則全部正式出。 -->
+<!-- MLB 全打版：R1 869風控版；R2 全新版B（1+50，淨值差1.0~2.5，讓分方節奏7.5~12.0，大小7.0~10.0）；R3 風控版（1-50，淨值和<4.5，排除受讓方節奏10.1~11.5）；不做每日最多2限制，符合規則全部正式出。 -->
 </script>
 </body>
 </html>
