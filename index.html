@@ -186,7 +186,7 @@
       <label class="league-toggle"><input type="checkbox" id="mlbToggle" checked> MLB</label>
       <button class="btn-primary" id="todayBtn">更新今天</button>
       <button class="btn-secondary" id="tomorrowBtn">更新明天</button>
-      <div class="window-note" id="windowNote">目前顯示：NBA 原規則重抓區間版（R1讓分淨值差-1.4～8.4｜R2讓分方淨值0.1～2.8｜R3讓分盤2.5～15.5｜R4讓分方節奏差-8.5～29.0｜R5淨值和-2.1～9.4）；MLB 全打版（R1：1-50受讓｜讓分方節奏8.1～11.8＋排除受讓方淨值-1～0；R2全新版：1+50讓分｜淨值差1.0～2.5＋讓分方節奏7.5～12.0＋大小7.0～10.0；R3風控版：1-50受讓｜淨值和<4.5＋排除受讓方節奏10.1～11.5；符合就全出）；雙重賽第二場起不判斷；MLB亞洲盤口每天自動匯入 Playsport；符合推薦會自動出現在右上推薦總欄</div>
+      <div class="window-note" id="windowNote">目前顯示：NBA 新邏輯4連敗版（N1一正一負讓分｜N2一正一負大分｜N3一正一負小分｜N4雙正分讓分｜N5雙負分讓分）；MLB 全打版（R1：1-50受讓｜讓分方節奏8.1～11.8＋排除受讓方淨值-1～0；R2全新版：1+50讓分｜淨值差1.0～2.5＋讓分方節奏7.5～12.0＋大小7.0～10.0；R3風控版：1-50受讓｜淨值和<4.5＋排除受讓方節奏10.1～11.5；符合就全出）；雙重賽第二場起不判斷；MLB亞洲盤口每天自動匯入 Playsport；符合推薦會自動出現在右上推薦總欄</div>
       <div class="status muted" id="status">尚未更新</div>
       <div class="status muted" id="cloudStatus">雲端寫入：待命</div>
       <div class="status muted" id="playsportStatus">Playsport盤口：待命</div>
@@ -441,12 +441,21 @@ function calcMlbPicksByManualAsianSelection(payload, asianLine) {
   let rule2 = 'PASS';
   let rule3 = 'PASS';
 
-  // MLB R1 869風控版：一正一負 + 1-50% + 買受讓方；讓分方節奏 8.1~11.8，排除受讓方淨值 -1~0。
+  // MLB R1 真4連敗版：一正一負 + 1-50% + 買受讓方；砍低效/波動區間。
   const r1FavoritePaceOk = favoritePace !== null && favoritePace >= 8.1 && favoritePace <= 11.8;
   const r1UnderdogNetOk = !(underdogNet !== null && underdogNet >= -1.0 && underdogNet < 0);
+  const r1ExcludeFavoriteNetOneToTwo = !(favoriteNet !== null && favoriteNet >= 1.0 && favoriteNet < 2.0);
+  const r1ExcludeUnderdogNetTwoToThree = !(underdogNet !== null && underdogNet >= 2.0 && underdogNet < 3.0);
+  const r1ExcludeNetDiffMinusOneToZero = !(favoriteNetDiff !== null && favoriteNetDiff >= -1.0 && favoriteNetDiff < 0);
+  const r1ExcludeNetDiffFiveToSix = !(favoriteNetDiff !== null && favoriteNetDiff >= 5.0 && favoriteNetDiff < 6.0);
+  const r1ExcludeFavoritePaceElevenToElevenHalf = !(favoritePace !== null && favoritePace >= 11.0 && favoritePace < 11.5);
+  const r1ExcludePaceDiffThreeToFour = !(favoritePaceDiff !== null && favoritePaceDiff >= 3.0 && favoritePaceDiff < 4.0);
   if (
     near10Pattern === '一正一負' && isMlbAsianLineValidForRule('rule1', asianLine) &&
-    r1FavoritePaceOk && r1UnderdogNetOk
+    r1FavoritePaceOk && r1UnderdogNetOk &&
+    r1ExcludeFavoriteNetOneToTwo && r1ExcludeUnderdogNetTwoToThree &&
+    r1ExcludeNetDiffMinusOneToZero && r1ExcludeNetDiffFiveToSix &&
+    r1ExcludeFavoritePaceElevenToElevenHalf && r1ExcludePaceDiffThreeToFour
   ) {
     rule1 = underdogName + ' 受讓';
   }
@@ -1681,11 +1690,11 @@ function getRecommendationItemsFromPayload(payload, leftName, rightName) {
     ['MLB 規則2｜1+50%｜買讓分方｜節奏差-0.5～4.5', formatRulePickForDisplay(payload['規則2讓分推薦'], leftName, rightName)],
     ['MLB 規則3｜1-50%｜雙正分買客隊受讓', formatRulePickForDisplay(payload['規則3讓分推薦'], leftName, rightName)]
   ] : [
-    ['NBA 規則1｜雙正分｜買讓分方｜讓分淨值差-1.4～8.4', formatRulePickForDisplay(payload['規則1讓分推薦'], leftName, rightName)],
-    ['NBA 規則2｜一正一負｜買讓分方｜讓分方淨值0.1～2.8', formatRulePickForDisplay(payload['規則2讓分推薦'], leftName, rightName)],
-    ['NBA 規則3｜雙負分｜買讓分方｜讓分盤2.5～15.5', formatRulePickForDisplay(payload['規則3讓分推薦'], leftName, rightName)],
-    ['NBA 規則4｜一正一負｜買大分｜讓分方節奏差-8.5～29.0', payload['規則3大小推薦'] || 'PASS'],
-    ['NBA 規則5｜一正一負｜買小分｜淨值和-2.1～9.4', payload['規則4大小推薦'] || 'PASS']
+    ['NBA N1｜一正一負｜讓分盤3.5～7.5｜節奏差≥10｜買讓分方', formatRulePickForDisplay(payload['規則1讓分推薦'], leftName, rightName)],
+    ['NBA N4｜雙正分｜大小218.5～230.5｜受讓方節奏230～245｜買讓分方', formatRulePickForDisplay(payload['規則2讓分推薦'], leftName, rightName)],
+    ['NBA N5｜雙負分｜讓分盤≥7.5｜讓分方淨值≥-2.5｜買讓分方', formatRulePickForDisplay(payload['規則3讓分推薦'], leftName, rightName)],
+    ['NBA N2｜一正一負｜讓分盤12.5～15.5｜讓分方節奏190～230｜買大分', payload['規則3大小推薦'] || 'PASS'],
+    ['NBA N3｜一正一負｜讓分盤0～3.5｜讓分方節奏230～250｜買小分', payload['規則4大小推薦'] || 'PASS']
   ]).filter(([, pick]) => pick && pick !== 'PASS');
   return items;
 }
@@ -2318,17 +2327,17 @@ function buildNbaHighProfitRulePicks(left, right, market) {
   const netDiff = (homeNet !== null && awayNet !== null) ? Math.abs(homeNet - awayNet) : null;
   const paceDiff = (homePace !== null && awayPace !== null) ? Math.abs(homePace - awayPace) : null;
 
-  // NBA 原規則重抓區間壓連敗版：5條單組合單規則。
-  // 規則1：雙正分｜買讓分方｜原規則 + 讓分淨值差 -1.4~8.4。
-  // 規則2：一正一負｜買讓分方｜原規則 + 讓分方淨值 0.1~2.8。
-  // 規則3：雙負分｜買讓分方｜原規則 + 讓分盤 2.5~15.5。
-  // 規則4：一正一負｜買大分｜原規則 + 讓分方節奏差 -8.5~29.0。
-  // 規則5：一正一負｜買小分｜原規則 + 淨值和 -2.1~9.4。
-  let rule1 = 'PASS'; // 雙正分 買讓分方
-  let rule2 = 'PASS'; // 一正一負 買讓分方
-  let rule3Spread = 'PASS'; // 雙負分 買讓分方
-  let rule3 = 'PASS'; // 一正一負 買大分
-  let rule4 = 'PASS'; // 一正一負 買小分
+  // NBA 新邏輯 4連敗風控版：N1～N5。
+  // N1：一正一負｜讓分盤 3.5～7.5｜節奏差 >= 10｜買讓分方；排除讓分盤7.5～9.5、大小235.5～240.5、淨值差10～12。
+  // N2：一正一負｜讓分盤 12.5～15.5｜讓分方節奏190～230｜買大分；排除淨值和4～6、淨值差8～10、受讓方節奏240～250。
+  // N3：一正一負｜讓分盤 0～3.5｜讓分方節奏230～250｜買小分；排除節奏差20～30、受讓方節奏210～220、受讓方淨值-5～-2.5。
+  // N4：雙正分｜大小分 218.5～230.5｜受讓方節奏230～245｜買讓分方；排除大小230.5～235.5、讓分盤0～2.5、9.5～12.5。
+  // N5：雙負分｜讓分盤 >= 7.5｜讓分方淨值 >= -2.5｜買讓分方；排除受讓方節奏200～210、大小245.5～260.5、210.5～215.5。
+  let rule1 = 'PASS'; // N1 一正一負 買讓分方
+  let rule2 = 'PASS'; // N4 雙正分 買讓分方
+  let rule3Spread = 'PASS'; // N5 雙負分 買讓分方
+  let rule3 = 'PASS'; // N2 一正一負 買大分
+  let rule4 = 'PASS'; // N3 一正一負 買小分
 
   const sideInfo = getMarketSideInfo(market, left.name, right.name);
   const near10Pattern = getNear10Pattern(homeNet, awayNet);
@@ -2352,49 +2361,65 @@ function buildNbaHighProfitRulePicks(left, right, market) {
     favoriteNetDiff = (favoriteNet !== null && underdogNet !== null) ? Number(favoriteNet) - Number(underdogNet) : null;
   }
 
+  const isNum = v => v !== null && v !== undefined && Number.isFinite(Number(v));
+  const between = (v, a, b) => isNum(v) && Number(v) >= a && Number(v) <= b;
+  const inHalfOpen = (v, a, b) => isNum(v) && Number(v) >= a && Number(v) < b;
+
   if (sideInfo && near10Pattern === '一正一負') {
+    // N1：讓分方讓分
     if (
-      totalLine !== null && Number.isFinite(totalLine) && totalLine >= 213.5 && totalLine <= 239.5 &&
-      netSum !== null && Number.isFinite(netSum) && netSum >= -2.5 && netSum <= 8.0 &&
-      favoritePace !== null && Number.isFinite(Number(favoritePace)) && Number(favoritePace) >= 220.25 && Number(favoritePace) <= 230.75 &&
-      favoritePaceDiff !== null && Number.isFinite(favoritePaceDiff) && favoritePaceDiff >= -8.5 && favoritePaceDiff <= 29.0
+      between(spreadLine, 3.5, 7.5) &&
+      isNum(favoritePaceDiff) && Number(favoritePaceDiff) >= 10 &&
+      !inHalfOpen(spreadLine, 7.5, 9.5) &&
+      !inHalfOpen(totalLine, 235.5, 240.5) &&
+      !inHalfOpen(favoriteNetDiff, 10, 12)
+    ) {
+      rule1 = `${sideInfo.favoriteName} 讓分`;
+    }
+
+    // N2：大分
+    if (
+      between(spreadLine, 12.5, 15.5) &&
+      between(favoritePace, 190, 230) &&
+      !inHalfOpen(netSum, 4, 6) &&
+      !inHalfOpen(favoriteNetDiff, 8, 10) &&
+      !inHalfOpen(underdogPace, 240, 250)
     ) {
       rule3 = '大分';
     }
 
+    // N3：小分
     if (
-      totalLine !== null && Number.isFinite(totalLine) && totalLine >= 220.5 && totalLine <= 237.5 &&
-      netSum !== null && Number.isFinite(netSum) && netSum >= -2.1 && netSum <= 9.4 &&
-      favoritePace !== null && Number.isFinite(Number(favoritePace)) && Number(favoritePace) >= 230.75 && Number(favoritePace) <= 256.5
+      between(spreadLine, 0, 3.5) &&
+      between(favoritePace, 230, 250) &&
+      !inHalfOpen(favoritePaceDiff, 20, 30) &&
+      !inHalfOpen(underdogPace, 210, 220) &&
+      !inHalfOpen(underdogNet, -5, -2.5)
     ) {
       rule4 = '小分';
     }
-
-    if (
-      favoriteNetDiff !== null && Number.isFinite(favoriteNetDiff) && favoriteNetDiff >= -16.75 && favoriteNetDiff <= 17.0 &&
-      favoriteNet !== null && Number.isFinite(Number(favoriteNet)) && Number(favoriteNet) >= 0.1 && Number(favoriteNet) <= 2.8 &&
-      favoritePace !== null && Number.isFinite(Number(favoritePace)) && Number(favoritePace) >= 213.5 && Number(favoritePace) <= 230.75
-    ) {
-      rule2 = `${sideInfo.favoriteName} 讓分`;
-    }
   }
 
+  // N4：雙正分買讓分方
   if (
     sideInfo && near10Pattern === '雙正分' &&
-    underdogNet !== null && Number.isFinite(Number(underdogNet)) && Number(underdogNet) >= 1.75 && Number(underdogNet) <= 4.5 &&
-    favoriteNet !== null && Number.isFinite(Number(favoriteNet)) && Number(favoriteNet) >= 3.0 && Number(favoriteNet) <= 12.5 &&
-    favoriteNetDiff !== null && Number.isFinite(favoriteNetDiff) && favoriteNetDiff >= -1.4 && favoriteNetDiff <= 8.4 &&
-    spreadLine !== null && Number.isFinite(spreadLine) && spreadLine >= 1.5 && spreadLine <= 6.5
+    between(totalLine, 218.5, 230.5) &&
+    between(underdogPace, 230, 245) &&
+    !inHalfOpen(totalLine, 230.5, 235.5) &&
+    !inHalfOpen(spreadLine, 0, 2.5) &&
+    !inHalfOpen(spreadLine, 9.5, 12.5)
   ) {
-    rule1 = `${sideInfo.favoriteName} 讓分`;
+    rule2 = `${sideInfo.favoriteName} 讓分`;
   }
 
+  // N5：雙負分買讓分方
   if (
     sideInfo && near10Pattern === '雙負分' &&
-    underdogPace !== null && Number.isFinite(Number(underdogPace)) && Number(underdogPace) >= 225.0 && Number(underdogPace) <= 236.5 &&
-    favoriteNet !== null && Number.isFinite(Number(favoriteNet)) && Number(favoriteNet) >= -7.5 && Number(favoriteNet) <= 0 &&
-    favoritePace !== null && Number.isFinite(Number(favoritePace)) && Number(favoritePace) >= 201.0 && Number(favoritePace) <= 233.5 &&
-    spreadLine !== null && Number.isFinite(spreadLine) && spreadLine >= 2.5 && spreadLine <= 15.5
+    isNum(spreadLine) && Number(spreadLine) >= 7.5 &&
+    isNum(favoriteNet) && Number(favoriteNet) >= -2.5 &&
+    !inHalfOpen(underdogPace, 200, 210) &&
+    !inHalfOpen(totalLine, 245.5, 260.5) &&
+    !inHalfOpen(totalLine, 210.5, 215.5)
   ) {
     rule3Spread = `${sideInfo.favoriteName} 讓分`;
   }
@@ -2721,7 +2746,7 @@ function buildNear10Card(leagueName, leagueKey, event, teamStatsMap, playSportMa
   const card = document.createElement('div');
   card.className = 'card match';
   const titleSub = leagueKey === 'nba'
-    ? `${leagueName}｜台灣時間 ${shortTime(event.date)}｜NBA指定規則：原規則重抓區間壓連敗版`
+    ? `${leagueName}｜台灣時間 ${shortTime(event.date)}｜NBA指定規則：新邏輯4連敗版`
     : `${leagueName}｜台灣時間 ${shortTime(event.date)}｜MLB指定規則：規則1 / 規則2 / 規則3`;
   const tagText = leagueKey === 'mlb' ? 'MLB指定規則' : 'NBA指定規則';
   const rawBetHtml = buildRuleDisplayHtml(payload, left.name, right.name);
